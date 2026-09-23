@@ -1,0 +1,295 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "federation-control/v1",
+  "title": "Federation Base durable control event",
+  "description": "Project control profile for the six durable lifecycle events. This is not an AGNTCY wire standard. A digest is not a signature or a bearer credential. No event carries an A2A task body, account inventory, connector credential, or private key.",
+  "type": "object",
+  "additionalProperties": false,
+  "required": [
+    "schema",
+    "event_id",
+    "kind",
+    "sender_platform_id",
+    "recipient_platform_id",
+    "originating_platform_id",
+    "relationship_id",
+    "request_id",
+    "actor_side",
+    "actor_revision",
+    "created_at",
+    "delivery_expires_at",
+    "payload"
+  ],
+  "properties": {
+    "schema": { "const": "federation-control/v1" },
+    "event_id": { "$ref": "#/$defs/id" },
+    "kind": {
+      "enum": [
+        "RELATIONSHIP_REQUEST",
+        "RELATIONSHIP_DECISION",
+        "RELATIONSHIP_REVOKE",
+        "RELATIONSHIP_STATUS",
+        "SOURCE_AUTHORIZATION_STATUS",
+        "CONFIG_ACK"
+      ]
+    },
+    "sender_platform_id": { "$ref": "#/$defs/id" },
+    "recipient_platform_id": { "$ref": "#/$defs/id" },
+    "originating_platform_id": { "$ref": "#/$defs/id" },
+    "relationship_id": { "$ref": "#/$defs/id" },
+    "request_id": { "oneOf": [{ "$ref": "#/$defs/id" }, { "type": "null" }] },
+    "actor_side": { "enum": ["SOURCE", "DESTINATION"] },
+    "actor_revision": { "$ref": "#/$defs/revision" },
+    "created_at": { "$ref": "#/$defs/utc" },
+    "delivery_expires_at": { "$ref": "#/$defs/utc" },
+    "payload": { "type": "object" }
+  },
+  "allOf": [
+    {
+      "if": { "properties": { "kind": { "const": "RELATIONSHIP_REQUEST" } } },
+      "then": {
+        "properties": {
+          "actor_side": { "const": "SOURCE" },
+          "payload": { "$ref": "#/$defs/requestPayload" }
+        }
+      }
+    },
+    {
+      "if": { "properties": { "kind": { "const": "RELATIONSHIP_DECISION" } } },
+      "then": {
+        "properties": {
+          "actor_side": { "const": "DESTINATION" },
+          "request_id": { "$ref": "#/$defs/id" },
+          "payload": { "$ref": "#/$defs/decisionPayload" }
+        }
+      }
+    },
+    {
+      "if": { "properties": { "kind": { "const": "RELATIONSHIP_REVOKE" } } },
+      "then": { "properties": { "payload": { "$ref": "#/$defs/revokePayload" } } }
+    },
+    {
+      "if": { "properties": { "kind": { "const": "RELATIONSHIP_STATUS" } } },
+      "then": { "properties": { "payload": { "$ref": "#/$defs/statusPayload" } } }
+    },
+    {
+      "if": { "properties": { "kind": { "const": "SOURCE_AUTHORIZATION_STATUS" } } },
+      "then": {
+        "properties": {
+          "actor_side": { "const": "SOURCE" },
+          "payload": { "$ref": "#/$defs/sourceAuthorizationPayload" }
+        }
+      }
+    },
+    {
+      "if": { "properties": { "kind": { "const": "CONFIG_ACK" } } },
+      "then": { "properties": { "payload": { "$ref": "#/$defs/configAckPayload" } } }
+    }
+  ],
+  "$defs": {
+    "id": { "type": "string", "minLength": 1, "maxLength": 256 },
+    "revision": { "type": "integer", "minimum": 1, "maximum": 9007199254740991 },
+    "utc": { "type": "string", "pattern": "^[0-9]{4}-[0-9]{2}-[0-9]{2}T[0-9]{2}:[0-9]{2}:[0-9]{2}(\\.[0-9]{1,9})?Z$" },
+    "digest": { "type": "string", "pattern": "^[0-9a-f]{64}$" },
+    "participant": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["platform_id", "subject_id", "resource_id"],
+      "properties": {
+        "platform_id": { "$ref": "#/$defs/id" },
+        "subject_id": { "$ref": "#/$defs/id" },
+        "resource_id": { "$ref": "#/$defs/id" }
+      }
+    },
+    "requestPayload": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["request", "request_terms_digest"],
+      "properties": {
+        "request": { "$ref": "#/$defs/relationshipRequest" },
+        "request_terms_digest": { "$ref": "#/$defs/digest" }
+      }
+    },
+    "relationshipRequest": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "relationship_id",
+        "request_id",
+        "direction",
+        "source",
+        "source_ownership_revision",
+        "request_kind",
+        "request_revision",
+        "base_lease_revision",
+        "application_protocol",
+        "transport",
+        "target",
+        "requested_permissions",
+        "requested_lifetime",
+        "created_at",
+        "request_expires_at"
+      ],
+      "properties": {
+        "relationship_id": { "$ref": "#/$defs/id" },
+        "request_id": { "$ref": "#/$defs/id" },
+        "direction": {
+          "type": "object",
+          "additionalProperties": false,
+          "required": ["source_platform_id", "destination_platform_id"],
+          "properties": {
+            "source_platform_id": { "$ref": "#/$defs/id" },
+            "destination_platform_id": { "$ref": "#/$defs/id" }
+          }
+        },
+        "source": { "$ref": "#/$defs/participant" },
+        "source_ownership_revision": { "$ref": "#/$defs/revision" },
+        "request_kind": { "enum": ["ESTABLISH", "RENEW", "MODIFY"] },
+        "request_revision": { "$ref": "#/$defs/revision" },
+        "base_lease_revision": { "oneOf": [{ "$ref": "#/$defs/revision" }, { "type": "null" }] },
+        "application_protocol": { "$ref": "#/$defs/id" },
+        "transport": { "$ref": "#/$defs/id" },
+        "target": {
+          "type": "object",
+          "additionalProperties": false,
+          "required": ["destination_platform_id", "full_agent_address"],
+          "properties": {
+            "destination_platform_id": { "$ref": "#/$defs/id" },
+            "full_agent_address": { "$ref": "#/$defs/id" }
+          }
+        },
+        "requested_permissions": {
+          "type": "array",
+          "minItems": 1,
+          "uniqueItems": true,
+          "items": { "$ref": "#/$defs/id" }
+        },
+        "requested_lifetime": { "$ref": "#/$defs/lifetime" },
+        "created_at": { "$ref": "#/$defs/revision" },
+        "request_expires_at": { "$ref": "#/$defs/revision" }
+      }
+    },
+    "lifetime": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["mode"],
+      "properties": {
+        "mode": { "enum": ["SINGLE_TASK", "FIXED", "UNTIL_REVOKED"] },
+        "expires_at": { "$ref": "#/$defs/revision" }
+      },
+      "allOf": [
+        {
+          "if": { "properties": { "mode": { "enum": ["SINGLE_TASK", "FIXED"] } } },
+          "then": { "required": ["expires_at"] }
+        },
+        {
+          "if": { "properties": { "mode": { "const": "UNTIL_REVOKED" } } },
+          "then": { "not": { "required": ["expires_at"] } }
+        }
+      ]
+    },
+    "decisionPayload": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["decision_id", "result", "bound_request_revision", "request_terms_digest", "destination", "destination_ownership_revision", "lease"],
+      "properties": {
+        "decision_id": { "$ref": "#/$defs/id" },
+        "result": { "enum": ["APPROVED", "DENIED", "BLOCKED"] },
+        "bound_request_revision": { "$ref": "#/$defs/revision" },
+        "request_terms_digest": { "$ref": "#/$defs/digest" },
+        "destination": { "oneOf": [{ "$ref": "#/$defs/participant" }, { "type": "null" }] },
+        "destination_ownership_revision": { "oneOf": [{ "$ref": "#/$defs/revision" }, { "type": "null" }] },
+        "lease": { "oneOf": [{ "$ref": "#/$defs/lease" }, { "type": "null" }] }
+      },
+      "allOf": [
+        {
+          "if": { "properties": { "result": { "const": "APPROVED" } } },
+          "then": {
+            "properties": {
+              "destination": { "$ref": "#/$defs/participant" },
+              "destination_ownership_revision": { "$ref": "#/$defs/revision" },
+              "lease": { "$ref": "#/$defs/lease" }
+            }
+          }
+        },
+        {
+          "if": { "properties": { "result": { "enum": ["DENIED", "BLOCKED"] } } },
+          "then": {
+            "properties": {
+              "destination": { "type": "null" },
+              "destination_ownership_revision": { "type": "null" },
+              "lease": { "type": "null" }
+            }
+          }
+        }
+      ]
+    },
+    "lease": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["lease_id", "lease_revision", "mode", "effective_from", "expires_at", "max_tasks", "effective_permissions", "terms_digest"],
+      "properties": {
+        "lease_id": { "$ref": "#/$defs/id" },
+        "lease_revision": { "$ref": "#/$defs/revision" },
+        "mode": { "enum": ["SINGLE_TASK", "FIXED", "UNTIL_REVOKED"] },
+        "effective_from": { "$ref": "#/$defs/revision" },
+        "expires_at": { "oneOf": [{ "$ref": "#/$defs/revision" }, { "type": "null" }] },
+        "max_tasks": { "oneOf": [{ "type": "integer", "minimum": 1, "maximum": 1 }, { "type": "null" }] },
+        "effective_permissions": {
+          "type": "array",
+          "minItems": 1,
+          "uniqueItems": true,
+          "items": { "$ref": "#/$defs/id" }
+        },
+        "terms_digest": { "$ref": "#/$defs/digest" }
+      }
+    },
+    "revokePayload": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["revocation_id", "lease_id", "lease_revision", "reason_code", "effective_at"],
+      "properties": {
+        "revocation_id": { "$ref": "#/$defs/id" },
+        "lease_id": { "$ref": "#/$defs/id" },
+        "lease_revision": { "$ref": "#/$defs/revision" },
+        "reason_code": { "$ref": "#/$defs/id" },
+        "effective_at": { "$ref": "#/$defs/utc" }
+      }
+    },
+    "statusPayload": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["lease_id", "lease_revision", "state", "observed_at"],
+      "properties": {
+        "lease_id": { "$ref": "#/$defs/id" },
+        "lease_revision": { "$ref": "#/$defs/revision" },
+        "state": { "enum": ["CONFIGURING", "READY", "REVOKED", "EXPIRED", "CONSUMED", "SUSPENDED"] },
+        "observed_at": { "$ref": "#/$defs/utc" }
+      }
+    },
+    "sourceAuthorizationPayload": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["lease_id", "lease_revision", "authorization_revision", "status", "effective_at"],
+      "properties": {
+        "lease_id": { "$ref": "#/$defs/id" },
+        "lease_revision": { "$ref": "#/$defs/revision" },
+        "authorization_revision": { "$ref": "#/$defs/revision" },
+        "status": { "enum": ["AUTHORIZED", "WITHDRAWN"] },
+        "effective_at": { "$ref": "#/$defs/utc" }
+      }
+    },
+    "configAckPayload": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["lease_id", "lease_revision", "configuration_revision", "key_purpose_revision", "acknowledged_at"],
+      "properties": {
+        "lease_id": { "$ref": "#/$defs/id" },
+        "lease_revision": { "$ref": "#/$defs/revision" },
+        "configuration_revision": { "$ref": "#/$defs/revision" },
+        "key_purpose_revision": { "$ref": "#/$defs/revision" },
+        "acknowledged_at": { "$ref": "#/$defs/utc" }
+      }
+    }
+  }
+}

@@ -140,3 +140,9 @@ The reverse direction is a second relationship. B asks for an A-domain handle, a
 ## Not in this package
 
 This profile does not publish private agents into a public catalog. It does not resolve short handles through DNS. Public `ans://` names, SLIM transport, and the AGNTCY Identity Service are not part of this connection; if one of those is enabled later, it has to be the upstream project, not a second copy written here. A Directory record, a SPIRE certificate, and an owner approval answer different questions, and all three are required before a request can be delivered.
+
+## Agent capabilities
+
+Agent-to-agent access and capabilities are a user-level responsibility. The person who runs the private agent chooses how that agent is built and what it is able to do. The platform's job is the connection: identify the other provider, carry one request to the owning account, and keep checking the lease, the grant, and each call.
+
+That split is the route for now. Later, an agent that opens an A2A connection outside its owner's own account may have to meet a stated standard of protections and protocols before a platform will accept it. The governance for that standard belongs with the private agent. Building that framework is not a platform product. A platform can make a conforming framework a condition of cross-account authorization, and it keeps checking that condition for as long as the relationship is in use.

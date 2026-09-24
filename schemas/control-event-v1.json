@@ -155,7 +155,7 @@
           "required": ["destination_platform_id", "full_agent_address"],
           "properties": {
             "destination_platform_id": { "$ref": "#/$defs/id" },
-            "full_agent_address": { "$ref": "#/$defs/id" }
+            "full_agent_address": { "type": "string", "pattern": "^[0-9a-hjkmnp-tv-z]{16,32}\\.[a-z0-9-]+(?:\\.[a-z0-9-]+)+$", "maxLength": 253 }
           }
         },
         "requested_permissions": {

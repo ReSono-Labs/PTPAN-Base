@@ -937,6 +937,16 @@ pub fn short_address_in_provider_domain(address: &str, domain: &str) -> bool {
         && target_address_in_provider_domain(address, domain)
 }
 
+/// Syntax shared by every Base caller before a provider-specific suffix is
+/// checked. The handle has one opaque label; the suffix is a provider domain.
+pub fn valid_private_short_address(address: &str) -> bool {
+    let Some((label, domain)) = address.split_once('.') else { return false; };
+    (16..=32).contains(&label.len())
+        && label.bytes().all(|b| matches!(b, b'0'..=b'9' | b'a'..=b'h' | b'j'..=b'k' | b'm'..=b'n' | b'p'..=b't' | b'v'..=b'z'))
+        && domain.contains('.')
+        && target_address_in_provider_domain(address, domain)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -962,9 +972,58 @@ mod tests {
 
     #[test]
     fn domain_key_service_and_bootstrap_must_all_match() {
-        let hello: serde_json::Value =
-            serde_json::from_str(include_str!("../../../fixtures/peer/provider-a-hello.json")).unwrap();
-        let mut manifest = hello["payload"]["manifest"].clone();
+        let mut manifest = serde_json::json!({
+    "schema": "federation-provider/1",
+    "manifest_id": "provider-a-test-1",
+    "revision": 1,
+    "generated_at": "2026-09-23T08:00:00Z",
+    "platform": {
+        "platform_id": "provider-a",
+        "display_name": "Provider A test fixture",
+        "display_name_source": "LOCAL_METADATA",
+        "operator_name": "Provider A test operator",
+        "website": "https://provider-a.test",
+        "documentation_url": null,
+        "logo_url": null
+    },
+    "discovery": {
+        "ai_catalog_url": "https://catalog.provider-a.test",
+        "host_identifier": null,
+        "host_trust_manifest_ref": null,
+        "directory_endpoint": "https://directory.provider-a.test",
+        "directory_profile": "SPIRE_X509",
+        "publisher_name_ref": null,
+        "record_cids": [],
+        "domain_proof_ref": null
+    },
+    "workload_trust": {
+        "trust_domain": "provider-a.test",
+        "bundle_endpoint": "https://bundle.provider-a.test",
+        "bundle_profile": "https_spiffe",
+        "control_service_identity": "spiffe://provider-a.test/federation/control",
+        "control_service_role": "CONTROL"
+    },
+    "federation": {
+        "control_endpoint": "https://provider-a-bridge:8444/control",
+        "control_protocols": [
+            "federation-peer/v1",
+            "federation-control/v1"
+        ],
+        "relationship_lease_profiles": [
+            "FRL/1"
+        ],
+        "base_capabilities": [
+            "REQUEST_DELIVERY"
+        ]
+    },
+    "application_protocols": [],
+    "transports": [],
+    "source_refs": {
+        "identity_evidence": [],
+        "agent_card": [],
+        "ans": []
+    }
+});
         let name = "http://provider-a.test:8080/providers/test-1";
         manifest["discovery"]["domain_proof_ref"] = serde_json::json!(name);
         manifest["discovery"]["publisher_name_ref"] = serde_json::json!(name);

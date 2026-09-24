@@ -48,6 +48,7 @@ pub enum ModelError {
     InvalidTermsDigest,
     Canonicalization,
     InvalidJson,
+    InvalidTargetAddress,
     MessageTooLarge,
 }
 
@@ -182,6 +183,9 @@ impl RelationshipRequest {
         }
         if self.target.full_agent_address.trim().is_empty() {
             return Err(ModelError::EmptyId);
+        }
+        if !identity_evidence::valid_private_short_address(&self.target.full_agent_address) {
+            return Err(ModelError::InvalidTargetAddress);
         }
         if self.application_protocol.trim().is_empty() || self.transport.trim().is_empty() {
             return Err(ModelError::EmptyId);
@@ -639,7 +643,7 @@ mod tests {
             transport: "https".into(),
             target: PendingTarget {
                 destination_platform_id: platform("b"),
-                full_agent_address: "calendar.someuser.providerb.example".into(),
+                full_agent_address: "0123456789abcdef.providerb.example".into(),
             },
             requested_permissions: BTreeSet::from(["a2a.invoke".into()]),
             requested_lifetime: LifetimeRequest::Fixed { expires_at: 3000 },
@@ -725,14 +729,14 @@ mod tests {
 
     #[test]
     fn typed_request_parser_rejects_duplicate_unknown_and_oversized_input() {
-        let fixture: serde_json::Value =
-            serde_json::from_str(include_str!("../../../schemas/terms-v1/vectors.json")).unwrap();
-        let raw = fixture["request_canonical"].as_str().unwrap();
+        let raw = String::from_utf8(request().canonical_requested_terms().unwrap()).unwrap();
         let parsed = parse_relationship_request_json(raw.as_bytes()).unwrap();
-        assert_eq!(parsed.request_id.as_str(), "req-a-1");
+        assert_eq!(parsed.request_id.as_str(), "request-1");
+        let long_address = raw.replace("0123456789abcdef.providerb.example", "calendar.someuser.providerb.example");
+        assert_eq!(parse_relationship_request_json(long_address.as_bytes()), Err(ModelError::InvalidTargetAddress));
         let duplicate = raw.replacen(
-            "\"request_id\":\"req-a-1\",",
-            "\"request_id\":\"req-a-1\",\"request_id\":\"other\",",
+            "\"request_id\":\"request-1\",",
+            "\"request_id\":\"request-1\",\"request_id\":\"other\",",
             1,
         );
         assert_eq!(
@@ -748,7 +752,7 @@ mod tests {
             parse_relationship_request_json(&vec![b' '; 32 * 1024 + 1]),
             Err(ModelError::MessageTooLarge)
         );
-        let same_provider = raw.replace("provider-b", "provider-a");
+        let same_provider = raw.replace("\"destination_platform_id\":\"b\"", "\"destination_platform_id\":\"a\"");
         assert_eq!(
             parse_relationship_request_json(same_provider.as_bytes()),
             Err(ModelError::SameProvider)

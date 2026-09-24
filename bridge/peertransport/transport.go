@@ -1,4 +1,4 @@
-// Package peertransport supplies authenticated bytes to Federation Base.
+// Package peertransport supplies authenticated bytes to PTPAN Base.
 // SPIRE/go-spiffe own SVIDs, bundles, TLS verification, and exact peer service
 // authorization. This package neither parses Base events nor approves peers.
 package peertransport

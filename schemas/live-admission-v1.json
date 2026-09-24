@@ -1,7 +1,7 @@
 {
   "$schema": "https://json-schema.org/draft/2020-12/schema",
   "$id": "live-admission/v1",
-  "title": "Federation Base live admission",
+  "title": "PTPAN Base live admission",
   "description": "Project control profile for one live admission check. This is not an AGNTCY wire standard. It is not a lifecycle outbox event and it does not carry an A2A task body or a destination credential.",
   "oneOf": [
     { "$ref": "#/$defs/request" },

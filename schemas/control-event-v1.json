@@ -1,7 +1,7 @@
 {
   "$schema": "https://json-schema.org/draft/2020-12/schema",
   "$id": "federation-control/v1",
-  "title": "Federation Base durable control event",
+  "title": "PTPAN Base durable control event",
   "description": "Project control profile for the six durable lifecycle events. This is not an AGNTCY wire standard. A digest is not a signature or a bearer credential. No event carries an A2A task body, account inventory, connector credential, or private key.",
   "type": "object",
   "additionalProperties": false,

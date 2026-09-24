@@ -1,7 +1,7 @@
 {
   "$schema": "https://json-schema.org/draft/2020-12/schema",
   "$id": "federation-control/v2",
-  "title": "Federation Base configuration and admission-key acknowledgment",
+  "title": "PTPAN Base configuration and admission-key acknowledgment",
   "description": "Project-owned versioned CONFIG_ACK profile. The source host asserts an account-owned Ed25519 admission public key over the authenticated provider service; possession is verified separately on each live admission. No private key or account inventory is sent.",
   "type": "object",
   "additionalProperties": false,

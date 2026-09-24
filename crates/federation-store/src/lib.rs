@@ -1,4 +1,4 @@
-//! Storage contracts for provider-owned Federation Base adapters.
+//! Storage contracts for provider-owned PTPAN Base adapters.
 //!
 //! This crate has no database driver, tables, migrations, connection string,
 //! or assumption that two providers use the same persistence technology.

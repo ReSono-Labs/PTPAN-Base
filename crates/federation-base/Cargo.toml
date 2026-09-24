@@ -3,7 +3,7 @@ name = "federation-base"
 version = "0.1.0"
 edition = "2021"
 license = "Apache-2.0"
-description = "Host-neutral Federation Base policy and relationship types"
+description = "Host-neutral PTPAN Base policy and relationship types"
 
 [dependencies]
 serde = { version = "1", features = ["derive"] }

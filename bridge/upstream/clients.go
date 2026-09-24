@@ -1,5 +1,5 @@
 // Package upstream calls the selected upstream Directory, OASF, and SPIFFE
-// modules. It does not make Federation Base peer or relationship decisions.
+// modules. It does not make PTPAN Base peer or relationship decisions.
 package upstream
 
 import (

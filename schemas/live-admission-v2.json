@@ -1,7 +1,7 @@
 {
   "$schema": "https://json-schema.org/draft/2020-12/schema",
   "$id": "live-admission/v2",
-  "title": "Federation Base live admission",
+  "title": "PTPAN Base live admission",
   "description": "Project-owned signed live admission request. The account-owned Ed25519 proof binds the exact source authorization and request; the response remains live-admission/v1. No destination credential or A2A task body is carried.",
   "oneOf": [
     {

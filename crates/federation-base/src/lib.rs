@@ -1,4 +1,4 @@
-//! Host-neutral Federation Base policy types.
+//! Host-neutral PTPAN Base policy types.
 //!
 //! This crate does not implement AGNTCY Directory, OASF, SPIFFE, host grants, or
 //! A2A. Those mechanisms cross explicit integration boundaries. The types here

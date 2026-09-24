@@ -1,6 +1,6 @@
-# Federation Base
+# PTPAN Base
 
-Federation Base is the connection between two independently operated agent platforms. Each platform keeps its own accounts, agents, grants, keys, and task runtime. Base does not merge those interiors. It gives both platforms the same rules for trusting each other and for carrying one private request from a user on one platform to an agent that lives on the other.
+PTPAN Base (Private-to-Private Agent Network) is the connection between two independently operated agent platforms. Each platform keeps its own accounts, agents, grants, keys, and task runtime. Base does not merge those interiors. It gives both platforms the same rules for trusting each other and for carrying one private request from a user on one platform to an agent that lives on the other.
 
 A platform can keep serving its own users with no peer connected. Base is involved when a user asks to reach an agent on a different platform.
 
@@ -17,7 +17,7 @@ The platform's own host adapter is the authority for:
 - the agent's admission signing key
 - task execution
 
-Federation Base supplies the policy types and the required outcomes. It does not ship a shared account database or a production SQL schema. Two platforms never query each other's account tables.
+PTPAN Base supplies the policy types and the required outcomes. It does not ship a shared account database or a production SQL schema. Two platforms never query each other's account tables.
 
 ## What you install
 

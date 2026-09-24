@@ -30,6 +30,34 @@ pub struct PeerBinding {
     pub generation: u64,
 }
 
+/// Account-scoped result of a completed source request. The notice contains
+/// no destination account, agent, address suggestions, or lookup details.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub enum SourceRequestNoticeKind {
+    AddressNotRecognized,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct SourceRequestNotice {
+    pub request_id: OpaqueId,
+    pub peer: PlatformId,
+    pub kind: SourceRequestNoticeKind,
+}
+
+/// Required private lookup index for the destination adapter. A provider may
+/// implement this with SQL, a KV store, or its existing account service. The
+/// key is the entire provider-scoped short address, never a public DNS query.
+/// The result is local-only and must be rechecked against current ownership
+/// before an Inbox item is created. Retired keys must not resolve.
+pub trait ShortAddressResolutionStore {
+    type Error;
+
+    fn resolve_current_short_address(
+        &self,
+        short_address: &str,
+    ) -> Result<Option<(Participant, u64)>, Self::Error>;
+}
+
 /// A provider adapter must persist these transitions atomically within its
 /// own security boundary. The authenticated service observation and verified
 /// identity evidence must come from the upstream bridge/verification path;
@@ -139,6 +167,13 @@ pub trait SourceHostPort {
         ownership_revision: u64,
     ) -> Result<(), Self::Error>;
     fn sent_count(&self, actor_account: &OpaqueId) -> Result<u64, Self::Error>;
+    /// Read only the authenticated requester's own durable correction notice.
+    /// `commit_control_receipt` creates it atomically with the Sent state.
+    fn request_notice(
+        &self,
+        actor_account: &OpaqueId,
+        request_id: &OpaqueId,
+    ) -> Result<Option<SourceRequestNotice>, Self::Error>;
 }
 
 /// Durable peer inbox. The adapter commits the transition from

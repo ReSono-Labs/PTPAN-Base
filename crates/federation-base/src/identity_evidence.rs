@@ -924,10 +924,41 @@ pub fn target_address_in_provider_domain(address: &str, domain: &str) -> bool {
             .is_some_and(|prefix| prefix.ends_with('.') && prefix.len() > 1)
 }
 
+/// Private provider-scoped short address. Issuers start with 16 base32
+/// characters; accepting up to 32 permits longer keys without a schema
+/// migration. The provider suffix is an authenticated routing hint, not a
+/// public DNS lookup or proof that the target exists.
+pub fn short_address_in_provider_domain(address: &str, domain: &str) -> bool {
+    let Some(label) = address.strip_suffix(domain).and_then(|prefix| prefix.strip_suffix('.')) else {
+        return false;
+    };
+    (16..=32).contains(&label.len())
+        && label.bytes().all(|b| matches!(b, b'0'..=b'9' | b'a'..=b'h' | b'j'..=b'k' | b'm'..=b'n' | b'p'..=b't' | b'v'..=b'z'))
+        && target_address_in_provider_domain(address, domain)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
     use crate::provider_manifest::parse_manifest;
+
+    #[test]
+    fn provider_scoped_short_handles_allow_length_growth_without_accepting_internal_names() {
+        let domain = "provider-b.test";
+        for width in [16, 17, 18, 32] {
+            let address = format!("{}.{}", "a".repeat(width), domain);
+            assert!(short_address_in_provider_domain(&address, domain));
+        }
+        for invalid in [
+            format!("{}.{}", "a".repeat(15), domain),
+            format!("{}.{}", "a".repeat(33), domain),
+            "calendar.someone.provider-b.test".into(),
+            "iiiiiiiiiiiiiiii.provider-b.test".into(),
+            "aaaaaaaaaaaaaaaa.provider-c.test".into(),
+        ] {
+            assert!(!short_address_in_provider_domain(&invalid, domain));
+        }
+    }
 
     #[test]
     fn domain_key_service_and_bootstrap_must_all_match() {

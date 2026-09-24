@@ -52,6 +52,24 @@ pub struct SourceRequestNotice {
 pub trait ShortAddressResolutionStore {
     type Error;
 
+    /// Issue a provider-scoped, unpredictable 80-bit handle. Keep the full
+    /// mapping private and retain issued labels after retirement so they can
+    /// never be assigned to a different resource.
+    fn issue_short_address(
+        &self,
+        agent_id: &OpaqueId,
+        now: u64,
+    ) -> Result<String, Self::Error>;
+
+    /// Stop resolution of exactly this agent's handle. Retirement does not
+    /// transfer an existing relationship to a different agent or owner.
+    fn retire_short_address(
+        &self,
+        agent_id: &OpaqueId,
+        short_address: &str,
+        now: u64,
+    ) -> Result<(), Self::Error>;
+
     fn resolve_current_short_address(
         &self,
         short_address: &str,

@@ -192,3 +192,52 @@ mod base64_bytes {
         STANDARD.decode(value).map_err(serde::de::Error::custom)
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    #[test]
+    fn base64_wire_matches_go_encoding_and_rejects_extra_fields() {
+        let request = Request {
+            schema: SCHEMA.into(),
+            operation: Operation::ReceiveControl,
+            service_id: "spiffe://a.test/control".into(),
+            body: b"{\"x\":1}".to_vec(),
+        };
+        let encoded = serde_json::to_string(&request).unwrap();
+        assert!(encoded.contains("\"body\":\"eyJ4IjoxfQ==\""));
+        assert_eq!(serde_json::from_str::<Request>(&encoded).unwrap(), request);
+        assert!(serde_json::from_str::<Request>(
+            &encoded.replace("\"schema\":", "\"forged\":true,\"schema\":")
+        )
+        .is_err());
+    }
+    #[test]
+    fn unix_peer_credentials_gate_roundtrip() {
+        let path = std::env::temp_dir().join(format!(
+            "federation-ipc-test-{}-{}.sock",
+            std::process::id(),
+            1
+        ));
+        let listener = bind(&path).unwrap();
+        let uid = unsafe { libc::geteuid() };
+        let worker = std::thread::spawn(move || {
+            accept_one(&listener, uid, |request| Response {
+                schema: String::new(),
+                body: request.body,
+                error_code: String::new(),
+            })
+            .unwrap()
+        });
+        let request = Request {
+            schema: SCHEMA.into(),
+            operation: Operation::SendControl,
+            service_id: "spiffe://b.test/federation/control".into(),
+            body: b"hello".to_vec(),
+        };
+        let reply = call(&path, uid, &request).unwrap();
+        assert_eq!(reply.body, b"hello");
+        worker.join().unwrap();
+        fs::remove_file(path).unwrap();
+    }
+}

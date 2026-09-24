@@ -608,3 +608,318 @@ pub fn classify_inbound_request(
         LocalAddressResolution::NotRecognized => Ok(LocalIngressResult::AddressNotRecognized),
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn id(value: &str) -> OpaqueId {
+        OpaqueId::new(value).unwrap()
+    }
+
+    fn platform(value: &str) -> PlatformId {
+        PlatformId::new(value).unwrap()
+    }
+
+    fn request() -> RelationshipRequest {
+        RelationshipRequest {
+            relationship_id: id("relationship-a-b"),
+            request_id: id("request-1"),
+            direction: Direction::new(platform("a"), platform("b")).unwrap(),
+            source: Participant {
+                platform_id: platform("a"),
+                subject_id: id("a-account"),
+                resource_id: id("a-agent"),
+            },
+            source_ownership_revision: 1,
+            request_kind: RequestKind::Establish,
+            request_revision: 1,
+            base_lease_revision: None,
+            application_protocol: "a2a".into(),
+            transport: "https".into(),
+            target: PendingTarget {
+                destination_platform_id: platform("b"),
+                full_agent_address: "calendar.someuser.providerb.example".into(),
+            },
+            requested_permissions: BTreeSet::from(["a2a.invoke".into()]),
+            requested_lifetime: LifetimeRequest::Fixed { expires_at: 3000 },
+            created_at: 1000,
+            request_expires_at: 1200,
+        }
+    }
+
+    fn destination() -> Participant {
+        Participant {
+            platform_id: platform("b"),
+            subject_id: id("b-account"),
+            resource_id: id("b-agent"),
+        }
+    }
+
+    fn lease() -> RelationshipLease {
+        RelationshipLease {
+            lease_id: id("lease-b-1"),
+            relationship_id: id("relationship-a-b"),
+            lease_revision: 1,
+            mode: LeaseMode::Fixed,
+            effective_from: 1100,
+            expires_at: Some(1160),
+            max_tasks: None,
+            granted_by_platform_id: platform("b"),
+            decision_id: id("decision-b-1"),
+            request_id: id("request-1"),
+            effective_permissions: BTreeSet::from(["a2a.invoke".into()]),
+            terms_digest: [1; 32],
+        }
+    }
+
+    #[test]
+    fn destination_can_narrow_but_not_broaden() {
+        let request = request();
+        let mut lease = lease();
+        assert_eq!(lease.validate_against(&request, &destination()), Ok(()));
+        lease.expires_at = Some(3001);
+        assert_eq!(
+            lease.validate_against(&request, &destination()),
+            Err(ModelError::LifetimeBroadened)
+        );
+        lease.expires_at = Some(1160);
+        lease.effective_permissions.insert("account.read".into());
+        assert_eq!(
+            lease.validate_against(&request, &destination()),
+            Err(ModelError::ScopeBroadened)
+        );
+    }
+
+    #[test]
+    fn canonical_request_and_effective_digests_bind_distinct_terms() {
+        let request = request();
+        let mut lease = lease();
+        let request_digest = request.request_terms_digest().unwrap();
+        lease.terms_digest = lease
+            .compute_terms_digest(&request, &destination(), 1)
+            .unwrap();
+        assert_ne!(request_digest, lease.terms_digest);
+        assert_eq!(
+            lease.verify_terms_digest(&request, &destination(), 1),
+            Ok(())
+        );
+        assert_eq!(
+            lease.verify_terms_digest(&request, &destination(), 2),
+            Err(ModelError::InvalidTermsDigest)
+        );
+        let mut changed_request = request.clone();
+        changed_request.target.full_agent_address.push_str(".wrong");
+        assert_ne!(
+            request_digest,
+            changed_request.request_terms_digest().unwrap()
+        );
+        let mut changed_lease = lease.clone();
+        changed_lease
+            .effective_permissions
+            .insert("account.read".into());
+        assert!(changed_lease
+            .verify_terms_digest(&request, &destination(), 1)
+            .is_err());
+    }
+
+    #[test]
+    fn typed_request_parser_rejects_duplicate_unknown_and_oversized_input() {
+        let fixture: serde_json::Value =
+            serde_json::from_str(include_str!("../../../schemas/terms-v1/vectors.json")).unwrap();
+        let raw = fixture["request_canonical"].as_str().unwrap();
+        let parsed = parse_relationship_request_json(raw.as_bytes()).unwrap();
+        assert_eq!(parsed.request_id.as_str(), "req-a-1");
+        let duplicate = raw.replacen(
+            "\"request_id\":\"req-a-1\",",
+            "\"request_id\":\"req-a-1\",\"request_id\":\"other\",",
+            1,
+        );
+        assert_eq!(
+            parse_relationship_request_json(duplicate.as_bytes()),
+            Err(ModelError::InvalidJson)
+        );
+        let unknown = format!("{{\"surprise\":true,{}", &raw[1..]);
+        assert_eq!(
+            parse_relationship_request_json(unknown.as_bytes()),
+            Err(ModelError::InvalidJson)
+        );
+        assert_eq!(
+            parse_relationship_request_json(&vec![b' '; 32 * 1024 + 1]),
+            Err(ModelError::MessageTooLarge)
+        );
+        let same_provider = raw.replace("provider-b", "provider-a");
+        assert_eq!(
+            parse_relationship_request_json(same_provider.as_bytes()),
+            Err(ModelError::SameProvider)
+        );
+    }
+
+    #[test]
+    fn source_cannot_issue_destination_lease() {
+        let mut lease = lease();
+        lease.granted_by_platform_id = platform("a");
+        assert_eq!(
+            lease.validate_against(&request(), &destination()),
+            Err(ModelError::WrongDestinationIssuer)
+        );
+    }
+
+    #[test]
+    fn reverse_relationship_is_independent() {
+        let request = request();
+        let reverse = request.direction.reverse();
+        assert_eq!(reverse.source_platform_id, platform("b"));
+        assert_eq!(reverse.destination_platform_id, platform("a"));
+        assert_ne!(reverse, request.direction);
+    }
+
+    #[test]
+    fn fixed_expiry_and_shorter_deadline_apply_without_status_event() {
+        let lease = lease();
+        assert_eq!(lease.admission_deadline(1100, &[1150, 1200]), Some(1150));
+        assert_eq!(lease.admission_deadline(1160, &[1200]), None);
+    }
+
+    #[test]
+    fn one_task_requires_finite_expiry_and_one_task_limit() {
+        let mut request = request();
+        request.requested_lifetime = LifetimeRequest::SingleTask { expires_at: 3000 };
+        let mut lease = lease();
+        lease.mode = LeaseMode::SingleTask;
+        lease.max_tasks = Some(1);
+        assert_eq!(lease.validate_against(&request, &destination()), Ok(()));
+        lease.max_tasks = None;
+        assert_eq!(
+            lease.validate_against(&request, &destination()),
+            Err(ModelError::InvalidLeaseMode)
+        );
+    }
+
+    #[test]
+    fn destination_may_choose_a_stricter_lifetime_mode() {
+        let mut request = request();
+        request.requested_lifetime = LifetimeRequest::UntilRevoked;
+        assert_eq!(lease().validate_against(&request, &destination()), Ok(()));
+        let mut one_task = lease();
+        one_task.mode = LeaseMode::SingleTask;
+        one_task.max_tasks = Some(1);
+        assert_eq!(one_task.validate_against(&request, &destination()), Ok(()));
+
+        request.requested_lifetime = LifetimeRequest::Fixed { expires_at: 3000 };
+        assert_eq!(one_task.validate_against(&request, &destination()), Ok(()));
+        request.requested_lifetime = LifetimeRequest::SingleTask { expires_at: 3000 };
+        assert_eq!(
+            lease().validate_against(&request, &destination()),
+            Err(ModelError::LifetimeBroadened)
+        );
+    }
+
+    #[test]
+    fn approval_after_pending_request_expiry_is_invalid() {
+        let mut expired_decision = lease();
+        expired_decision.effective_from = request().request_expires_at;
+        assert_eq!(
+            expired_decision.validate_against(&request(), &destination()),
+            Err(ModelError::InvalidTime)
+        );
+    }
+
+    #[test]
+    fn non_active_peer_never_permits_new_authority() {
+        for state in [
+            PeerState::Pending,
+            PeerState::Suspended,
+            PeerState::Removing,
+            PeerState::Removed,
+        ] {
+            assert!(!state.permits_new_authority());
+        }
+        assert!(PeerState::Active.permits_new_authority());
+    }
+
+    fn approved_gate() -> PeerRequestGate {
+        PeerRequestGate {
+            state: PeerState::Active,
+            local_operator_approved: true,
+            remote_operator_approval_confirmed: true,
+            peer_identity_verified: true,
+            exact_service_authenticated: true,
+        }
+    }
+
+    #[test]
+    fn provider_trust_requires_both_approvals_and_exact_service() {
+        let mut gate = approved_gate();
+        assert!(gate.permits_request_delivery());
+        gate.remote_operator_approval_confirmed = false;
+        assert!(!gate.permits_request_delivery());
+        gate.remote_operator_approval_confirmed = true;
+        gate.exact_service_authenticated = false;
+        assert!(!gate.permits_request_delivery());
+    }
+
+    #[test]
+    fn private_address_resolution_stays_local_and_unknown_has_no_owner() {
+        let request = request();
+        let gate = approved_gate();
+        let local = platform("b");
+        let peer = platform("a");
+        let found = classify_inbound_request(
+            &request,
+            &peer,
+            &local,
+            &gate,
+            1100,
+            LocalAddressResolution::Found {
+                destination: destination(),
+                ownership_revision: 3,
+            },
+        )
+        .unwrap();
+        assert_eq!(
+            found.delivery_result(),
+            RequestDeliveryResult::QueuedForLocalOwner
+        );
+        let unknown = classify_inbound_request(
+            &request,
+            &peer,
+            &local,
+            &gate,
+            1100,
+            LocalAddressResolution::NotRecognized,
+        )
+        .unwrap();
+        assert_eq!(
+            unknown.delivery_result(),
+            RequestDeliveryResult::AddressNotRecognized
+        );
+    }
+
+    #[test]
+    fn inbound_request_rejects_unapproved_or_wrong_peer_before_account_routing() {
+        let request = request();
+        let local = platform("b");
+        let found = LocalAddressResolution::Found {
+            destination: destination(),
+            ownership_revision: 3,
+        };
+        assert_eq!(
+            classify_inbound_request(
+                &request,
+                &platform("c"),
+                &local,
+                &approved_gate(),
+                1100,
+                found.clone()
+            ),
+            Err(ModelError::WrongAuthenticatedPeer)
+        );
+        let mut gate = approved_gate();
+        gate.local_operator_approved = false;
+        assert_eq!(
+            classify_inbound_request(&request, &platform("a"), &local, &gate, 1100, found),
+            Err(ModelError::PeerNotApproved)
+        );
+    }
+}

@@ -310,3 +310,67 @@ pub fn decode_digest(value: &str) -> Result<[u8; 32], PeerWireError> {
     }
     Ok(bytes)
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    #[test]
+    fn trust_request_is_bounded_and_sender_bound() {
+        let zero = "00".repeat(32);
+        let one = "11".repeat(32);
+        let json = serde_json::json!({"schema":"federation-peer/v1","message_id":"m1","kind":"TRUST_REQUEST","sender_platform_id":"provider-a","recipient_platform_id":"provider-b","generation":1,"sent_at":"2026-09-23T08:00:00Z","payload":{"request_id":"trust-1","sender_manifest_digest":zero,"recipient_manifest_digest":one,"requested_capabilities":["REQUEST_DELIVERY"],"expires_at":"2026-09-24T08:00:00Z"}});
+        let bytes = serde_json::to_vec(&json).unwrap();
+        let a = PlatformId::new("provider-a").unwrap();
+        let b = PlatformId::new("provider-b").unwrap();
+        assert!(parse_peer_message(
+            &bytes,
+            &a,
+            &b,
+            "spiffe://provider-a.test/federation/control",
+            "spiffe://provider-a.test/federation/control"
+        )
+        .is_ok());
+        assert_eq!(
+            parse_peer_message(
+                &bytes,
+                &b,
+                &a,
+                "spiffe://provider-a.test/federation/control",
+                "spiffe://provider-a.test/federation/control"
+            ),
+            Err(PeerWireError::WrongPeer)
+        );
+        assert_eq!(
+            parse_peer_message(
+                &bytes,
+                &a,
+                &b,
+                "spiffe://provider-a.test/other",
+                "spiffe://provider-a.test/federation/control"
+            ),
+            Err(PeerWireError::WrongService)
+        );
+    }
+
+    #[test]
+    fn peer_receipt_binds_exact_message_and_receiver() {
+        let a = PlatformId::new("provider-a").unwrap();
+        let b = PlatformId::new("provider-b").unwrap();
+        let request = serde_json::json!({"schema":"federation-peer/v1","message_id":"m1","kind":"TRUST_REMOVE","sender_platform_id":"provider-a","recipient_platform_id":"provider-b","generation":2,"sent_at":"2026-09-23T08:00:00Z","payload":{"reason_code":"OPERATOR_REMOVED","effective_at":"2026-09-23T08:00:00Z"}});
+        let sent = parse_peer_message(
+            &serde_json::to_vec(&request).unwrap(),
+            &a,
+            &b,
+            "spiffe://provider-a.test/control",
+            "spiffe://provider-a.test/control",
+        )
+        .unwrap();
+        let mut receipt = serde_json::json!({"schema":"federation-peer-receipt/v1","sender_platform_id":"provider-b","recipient_platform_id":"provider-a","generation":2,"message_id":"m1","body_digest":hex_digest(&sent.body_digest),"result":"REMOVED"});
+        assert!(parse_peer_receipt(&serde_json::to_vec(&receipt).unwrap(), &sent, &b).is_ok());
+        receipt["body_digest"] = serde_json::json!("00".repeat(32));
+        assert_eq!(
+            parse_peer_receipt(&serde_json::to_vec(&receipt).unwrap(), &sent, &b),
+            Err(PeerWireError::InvalidField)
+        );
+    }
+}

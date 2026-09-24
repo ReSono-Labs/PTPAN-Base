@@ -365,3 +365,109 @@ pub(crate) fn utc_timestamp(value: &str) -> Result<UtcInstant, ManifestError> {
     };
     Ok(UtcInstant(year, month, day, hour, minute, second, fraction))
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn valid() -> ProviderManifest {
+        ProviderManifest {
+            schema: "federation-provider/1".into(),
+            manifest_id: "manifest-b-1".into(),
+            revision: 1,
+            generated_at: "2026-09-23T08:00:00Z".into(),
+            platform: ProviderPlatform {
+                platform_id: PlatformId::new("provider-b").unwrap(),
+                display_name: "Provider B".into(),
+                display_name_source: ClaimSource::LocalMetadata,
+                operator_name: "B Example LLC".into(),
+                website: "https://b.test".into(),
+                documentation_url: None,
+                logo_url: None,
+            },
+            discovery: ProviderDiscovery {
+                ai_catalog_url: "https://catalog.b.test".into(),
+                host_identifier: None,
+                host_trust_manifest_ref: None,
+                directory_endpoint: "https://directory.b.test".into(),
+                directory_profile: "SPIRE_X509".into(),
+                publisher_name_ref: None,
+                record_cids: vec![],
+                domain_proof_ref: None,
+            },
+            workload_trust: WorkloadTrust {
+                trust_domain: "provider-b.test".into(),
+                bundle_endpoint: "https://bundle.b.test".into(),
+                bundle_profile: "https_spiffe".into(),
+                control_service_identity: "spiffe://provider-b.test/federation/control".into(),
+                control_service_role: "CONTROL".into(),
+            },
+            federation: FederationEndpoint {
+                control_endpoint: "https://control.b.test/control".into(),
+                control_protocols: vec!["federation-control/v1".into()],
+                relationship_lease_profiles: vec!["FRL/1".into()],
+                base_capabilities: vec![],
+            },
+            application_protocols: vec![],
+            transports: vec![],
+            source_refs: ProviderSourceRefs {
+                identity_evidence: vec![],
+                agent_card: vec![],
+                ans: vec![],
+            },
+        }
+    }
+
+    #[test]
+    fn exact_bytes_digest_and_transport_binding() {
+        let raw = serde_json::to_vec(&valid()).unwrap();
+        let snapshot = parse_manifest(&raw).unwrap();
+        assert_eq!(snapshot.exact_bytes, raw);
+        assert_ne!(snapshot.digest, [0; 32]);
+        snapshot
+            .manifest
+            .check_authenticated_binding(
+                &PlatformId::new("provider-b").unwrap(),
+                "spiffe://provider-b.test/federation/control",
+            )
+            .unwrap();
+        assert_eq!(
+            snapshot.manifest.check_authenticated_binding(
+                &PlatformId::new("provider-b").unwrap(),
+                "spiffe://provider-b.test/other"
+            ),
+            Err(ManifestError::WrongService)
+        );
+    }
+
+    #[test]
+    fn duplicate_unknown_customer_field_and_malformed_claims_fail() {
+        let raw = serde_json::to_string(&valid()).unwrap();
+        assert_eq!(
+            parse_manifest(
+                raw.replace("\"revision\":1", "\"revision\":1,\"revision\":2")
+                    .as_bytes()
+            ),
+            Err(ManifestError::InvalidJson)
+        );
+        assert_eq!(
+            parse_manifest(
+                raw.replace(
+                    "\"operator_name\":",
+                    "\"account_inventory\":[],\"operator_name\":"
+                )
+                .as_bytes()
+            ),
+            Err(ManifestError::InvalidJson)
+        );
+        let mut bad = valid();
+        bad.discovery.directory_endpoint = "http://directory.b.test".into();
+        assert_eq!(
+            bad.validate(),
+            Err(ManifestError::InvalidField("discovery.directory_endpoint"))
+        );
+        bad = valid();
+        bad.generated_at = "2026-09-23T04:00:00-04:00".into();
+        assert_eq!(bad.validate(), Err(ManifestError::InvalidTime));
+    }
+}

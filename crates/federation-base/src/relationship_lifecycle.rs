@@ -305,3 +305,287 @@ fn authorization_revision(authorization: DurableSourceAuthorization) -> u64 {
         | DurableSourceAuthorization::Withdrawn { revision } => revision,
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::OpaqueId;
+
+    fn id(value: &str) -> OpaqueId {
+        OpaqueId::new(value).unwrap()
+    }
+
+    fn record() -> LifecycleRecord {
+        LifecycleRecord {
+            lease_revision: 2,
+            local_terms_digest: [4; 32],
+            remote_terms_digest: Some([4; 32]),
+            source_authorization: DurableSourceAuthorization::None,
+            destination_owner_current: true,
+            grant_usable: true,
+            provenance_current: true,
+            configuration_revision: 3,
+            acknowledged_configuration_revision: None,
+            key_purpose_revision: 5,
+            acknowledged_key_purpose_revision: None,
+            revoked: false,
+            block: PairBlock::Open,
+            prior_revisions: Vec::new(),
+            bound_task_id: None,
+        }
+    }
+
+    fn revoke(revision: u64) -> RevokePayload {
+        RevokePayload {
+            revocation_id: id("rev-1"),
+            lease_id: id("lease-1"),
+            lease_revision: revision,
+            reason_code: "owner".into(),
+            effective_at: "2026-09-23T08:00:00Z".into(),
+        }
+    }
+
+    fn ready_input(record: &LifecycleRecord) -> ReadinessInput<'_> {
+        ReadinessInput {
+            peer: PeerState::Active,
+            record,
+            host_source_authorization_current: true,
+            now: 1,
+            lease_expires_at: None,
+        }
+    }
+
+    #[test]
+    fn revoke_is_terminal_and_status_cannot_restore_it() {
+        let mut record = record();
+        apply_revoke(&mut record, &revoke(2)).unwrap();
+        assert!(record.revoked);
+        assert!(!record.grant_usable);
+        apply_status(
+            &record,
+            &StatusPayload {
+                lease_id: id("lease-1"),
+                lease_revision: 2,
+                state: RelationshipState::Ready,
+                observed_at: "2026-09-23T08:01:00Z".into(),
+            },
+        )
+        .unwrap();
+        assert!(record.revoked);
+        assert!(!derive_ready(ready_input(&record)));
+        assert_eq!(apply_revoke(&mut record, &revoke(1)), Err(LifecycleError::StaleRevision));
+        assert!(record.revoked);
+    }
+
+    #[test]
+    fn older_revoke_does_not_replace_the_current_lease() {
+        let mut record = record();
+        assert_eq!(
+            apply_revoke(&mut record, &revoke(1)),
+            Err(LifecycleError::StaleRevision)
+        );
+        assert!(!record.revoked);
+        assert!(record.grant_usable);
+    }
+
+    #[test]
+    fn authorized_hint_is_not_admission_proof_and_withdrawal_restricts() {
+        let mut record = record();
+        apply_source_authorization(
+            &mut record,
+            ActorSide::Source,
+            &SourceAuthorizationPayload {
+                lease_id: id("lease-1"),
+                lease_revision: 2,
+                authorization_revision: 1,
+                status: SourceAuthorization::Authorized,
+                effective_at: "2026-09-23T08:00:00Z".into(),
+            },
+        )
+        .unwrap();
+        assert_eq!(
+            record.source_authorization,
+            DurableSourceAuthorization::Hint { revision: 1 }
+        );
+        let mut without_host = ready_input(&record);
+        without_host.host_source_authorization_current = false;
+        assert!(!derive_ready(without_host));
+        apply_source_authorization(
+            &mut record,
+            ActorSide::Source,
+            &SourceAuthorizationPayload {
+                lease_id: id("lease-1"),
+                lease_revision: 2,
+                authorization_revision: 2,
+                status: SourceAuthorization::Withdrawn,
+                effective_at: "2026-09-23T08:02:00Z".into(),
+            },
+        )
+        .unwrap();
+        assert!(!derive_ready(ready_input(&record)));
+        assert_eq!(
+            apply_source_authorization(
+                &mut record,
+                ActorSide::Source,
+                &SourceAuthorizationPayload {
+                    lease_id: id("lease-1"),
+                    lease_revision: 2,
+                    authorization_revision: 1,
+                    status: SourceAuthorization::Authorized,
+                    effective_at: "2026-09-23T08:03:00Z".into(),
+                }
+            ),
+            Err(LifecycleError::StaleRevision)
+        );
+    }
+
+    #[test]
+    fn stale_config_ack_cannot_become_ready() {
+        let mut record = record();
+        assert_eq!(
+            apply_config_ack(
+                &mut record,
+                &ConfigAckPayload {
+                    lease_id: id("lease-1"),
+                    lease_revision: 2,
+                    configuration_revision: 2,
+                    key_purpose_revision: 5,
+                    acknowledged_at: "2026-09-23T08:00:00Z".into(),
+                    source_key: None,
+                }
+            ),
+            Err(LifecycleError::StaleAcknowledgment)
+        );
+        assert!(!derive_ready(ready_input(&record)));
+        apply_config_ack(
+            &mut record,
+            &ConfigAckPayload {
+                lease_id: id("lease-1"),
+                lease_revision: 2,
+                configuration_revision: 3,
+                key_purpose_revision: 5,
+                acknowledged_at: "2026-09-23T08:00:00Z".into(),
+                source_key: None,
+            },
+        )
+        .unwrap();
+        assert!(derive_ready(ready_input(&record)));
+    }
+
+    #[test]
+    fn unblock_does_not_resurrect_a_revoked_relationship() {
+        let mut record = record();
+        apply_block(&mut record);
+        apply_revoke(&mut record, &revoke(2)).unwrap();
+        assert_eq!(
+            apply_unblock(&mut record),
+            Err(LifecycleError::UnblockDoesNotRevive)
+        );
+        assert!(record.revoked);
+        assert_eq!(record.block, PairBlock::Blocked);
+        assert!(!derive_ready(ready_input(&record)));
+    }
+
+    #[test]
+    fn suspended_peer_allows_cleanup_but_not_new_authority() {
+        assert!(!peer_allows(
+            PeerState::Suspended,
+            AffirmativeTraffic::NewRelationship
+        ));
+        assert!(!peer_allows(PeerState::Suspended, AffirmativeTraffic::Admission));
+        assert!(peer_allows(
+            PeerState::Suspended,
+            AffirmativeTraffic::CleanupOrRevoke
+        ));
+        assert!(!pending_renewal_extends_current_lease());
+    }
+
+    #[test]
+    fn status_on_the_current_lease_does_not_change_authority() {
+        let record = record();
+        apply_status(
+            &record,
+            &StatusPayload {
+                lease_id: id("lease-1"),
+                lease_revision: 2,
+                state: RelationshipState::Configuring,
+                observed_at: "2026-09-23T08:00:00Z".into(),
+            },
+        )
+        .unwrap();
+        assert_eq!(record.lease_revision, 2);
+        assert!(!derive_ready(ready_input(&record)));
+    }
+
+    #[test]
+    fn finite_expiry_denies_without_an_expired_status_event() {
+        let mut record = record();
+        record.acknowledged_configuration_revision = Some(3);
+        record.acknowledged_key_purpose_revision = Some(5);
+        let mut current = ready_input(&record);
+        current.lease_expires_at = Some(10);
+        current.now = 9;
+        assert!(derive_ready(current));
+        current.now = 10;
+        assert!(!derive_ready(current));
+        apply_status(
+            &record,
+            &StatusPayload {
+                lease_id: id("lease-1"),
+                lease_revision: 2,
+                state: RelationshipState::Expired,
+                observed_at: "2026-09-23T08:00:00Z".into(),
+            },
+        )
+        .unwrap();
+        assert_eq!(record.lease_revision, 2);
+        assert!(record.grant_usable);
+    }
+
+    #[test]
+    fn renewal_archives_the_old_revision_and_does_not_stay_ready() {
+        let mut record = record();
+        record.acknowledged_configuration_revision = Some(3);
+        record.acknowledged_key_purpose_revision = Some(5);
+        record.bound_task_id = Some("task-1".into());
+        assert!(derive_ready(ready_input(&record)));
+        apply_renewal(&mut record, 3, [9; 32]).unwrap();
+        assert_eq!(
+            record.prior_revisions,
+            vec![AuditedRevision {
+                lease_revision: 2,
+                terms_digest: [4; 32],
+            }]
+        );
+        assert_eq!(record.lease_revision, 3);
+        assert!(record.remote_terms_digest.is_none());
+        assert!(!record.grant_usable);
+        assert!(record.bound_task_id.is_none());
+        assert!(!derive_ready(ready_input(&record)));
+        assert_eq!(
+            apply_renewal(&mut record, 2, [4; 32]),
+            Err(LifecycleError::StaleRevision)
+        );
+        assert_eq!(record.lease_revision, 3);
+    }
+
+    #[test]
+    fn single_task_binds_one_logical_id() {
+        let mut bound = None;
+        assert_eq!(
+            bind_single_task(&mut bound, LeaseMode::Fixed, "task-1"),
+            Err(TaskBindError::NotSingleTaskMode)
+        );
+        assert_eq!(
+            bind_single_task(&mut bound, LeaseMode::SingleTask, ""),
+            Err(TaskBindError::EmptyTaskId)
+        );
+        bind_single_task(&mut bound, LeaseMode::SingleTask, "task-1").unwrap();
+        bind_single_task(&mut bound, LeaseMode::SingleTask, "task-1").unwrap();
+        assert_eq!(
+            bind_single_task(&mut bound, LeaseMode::SingleTask, "task-2"),
+            Err(TaskBindError::DifferentTask)
+        );
+        assert_eq!(bound.as_deref(), Some("task-1"));
+    }
+}

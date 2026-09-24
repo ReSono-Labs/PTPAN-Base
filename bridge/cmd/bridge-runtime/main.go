@@ -91,6 +91,7 @@ func main() {
 				return nil, callErr
 			}
 			if response.ErrorCode != "" {
+				log.Printf("Base rejected inbound control service=%s code=%s", inbound.ServiceID, response.ErrorCode)
 				return nil, errors.New("Base rejected inbound control")
 			}
 			return response.Body, nil
@@ -131,6 +132,7 @@ func main() {
 			defer cancel()
 			body, sendErr := transport.SendTo(sendCtx, route.Endpoint, route.ServiceID, request.Body)
 			if sendErr != nil {
+				log.Printf("peer delivery failed service=%s: %v", route.ServiceID, sendErr)
 				return privateipc.Response{ErrorCode: "PEER_DELIVERY_FAILED"}
 			}
 			return privateipc.Response{Body: body}

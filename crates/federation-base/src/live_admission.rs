@@ -8,6 +8,7 @@ use crate::{OpaqueId, PeerState, PlatformId};
 use serde::{Deserialize, Serialize};
 
 pub const ADMISSION_SCHEMA: &str = "live-admission/v1";
+pub const SIGNED_ADMISSION_SCHEMA: &str = "live-admission/v2";
 const MAX_ADMISSION_BYTES: usize = 32 * 1024;
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -59,7 +60,7 @@ pub struct AdmissionRequest {
 pub fn admission_call_json(call: &LiveAdmissionCall) -> Result<Vec<u8>, serde_json::Error> {
     let mut body = serde_json::to_value(&call.request)?;
     let object = body.as_object_mut().expect("admission request is an object");
-    object.insert("schema".into(), serde_json::json!(ADMISSION_SCHEMA));
+    object.insert("schema".into(), serde_json::json!(if call.source_authorization.proof.is_some() { SIGNED_ADMISSION_SCHEMA } else { ADMISSION_SCHEMA }));
     object.insert("source_platform".into(), serde_json::to_value(&call.source_platform)?);
     object.insert(
         "source_authorization".into(),
@@ -84,6 +85,8 @@ pub struct SourceChallenge {
     pub caller_key_revision: u64,
     pub deadline: u64,
     pub withdrawn: bool,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub proof: Option<String>,
 }
 
 /// One live call from the authenticated source service. The source host
@@ -94,6 +97,20 @@ pub struct LiveAdmissionCall {
     pub source_platform: PlatformId,
     pub request: AdmissionRequest,
     pub source_authorization: SourceChallenge,
+}
+
+/// Canonical context signed by the source host's account-owned admission
+/// key. The peer service authenticates the provider; this proof establishes
+/// control of the separately bound agent key for this one live call.
+pub fn admission_proof_bytes(call: &LiveAdmissionCall) -> Result<Vec<u8>, serde_json::Error> {
+    let mut challenge = call.source_authorization.clone();
+    challenge.proof = None;
+    serde_json_canonicalizer::to_vec(&serde_json::json!({
+        "schema": SIGNED_ADMISSION_SCHEMA,
+        "source_platform": call.source_platform,
+        "request": call.request,
+        "source_authorization": challenge,
+    }))
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -205,9 +222,14 @@ pub fn parse_admission_request(bytes: &[u8]) -> Result<LiveAdmissionCall, Admiss
     }
     let wire: AdmissionWire =
         serde_json::from_slice(bytes).map_err(|_| AdmissionParseError::InvalidJson)?;
-    if wire.schema != ADMISSION_SCHEMA {
+    if wire.schema != ADMISSION_SCHEMA && wire.schema != SIGNED_ADMISSION_SCHEMA {
         return Err(AdmissionParseError::InvalidSchema);
     }
+    if (wire.schema == ADMISSION_SCHEMA && wire.source_authorization.proof.is_some())
+        || (wire.schema == SIGNED_ADMISSION_SCHEMA
+            && wire.source_authorization.proof.as_ref().is_none_or(|proof| proof.len() != 128
+                || !proof.bytes().all(|c| c.is_ascii_digit() || (b'a'..=b'f').contains(&c))))
+    { return Err(AdmissionParseError::InvalidField); }
     if wire.lease_revision == 0
         || wire.caller_key_revision == 0
         || wire.deadline == 0
@@ -295,4 +317,189 @@ fn challenge_matches(request: &AdmissionRequest, challenge: &SourceChallenge) ->
         && challenge.audience == request.audience
         && challenge.caller_key_purpose == request.caller_key_purpose
         && challenge.caller_key_revision == request.caller_key_revision
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn id(value: &str) -> OpaqueId {
+        OpaqueId::new(value).unwrap()
+    }
+
+    fn platform(value: &str) -> PlatformId {
+        PlatformId::new(value).unwrap()
+    }
+
+    fn request() -> AdmissionRequest {
+        AdmissionRequest {
+            relationship_id: id("relationship-1"),
+            lease_id: id("lease-1"),
+            lease_revision: 1,
+            source_subject: id("a-account"),
+            source_resource: id("a-agent"),
+            destination_platform: platform("provider-b"),
+            destination_resource: id("agent-1"),
+            caller_key_purpose: "admission".into(),
+            caller_key_revision: 4,
+            audience: "provider-b".into(),
+            challenge_nonce: "nonce-1".into(),
+            operation: "a2a.invoke".into(),
+            deadline: 200,
+        }
+    }
+
+    fn challenge(request: &AdmissionRequest) -> SourceChallenge {
+        SourceChallenge {
+            nonce: request.challenge_nonce.clone(),
+            relationship_id: request.relationship_id.clone(),
+            lease_revision: request.lease_revision,
+            source_subject: request.source_subject.clone(),
+            source_resource: request.source_resource.clone(),
+            destination_platform: request.destination_platform.clone(),
+            audience: request.audience.clone(),
+            caller_key_purpose: request.caller_key_purpose.clone(),
+            caller_key_revision: request.caller_key_revision,
+            deadline: request.deadline,
+            withdrawn: false,
+            proof: None,
+        }
+    }
+
+    fn facts<'a>(
+        request: &'a AdmissionRequest,
+        challenge: Option<&'a SourceChallenge>,
+    ) -> AdmissionFacts<'a> {
+        AdmissionFacts {
+            now: 150,
+            peer: PeerState::Active,
+            relationship_ready: true,
+            grant_allows_operation: true,
+            current_lease_id: &request.lease_id,
+            current_lease_revision: request.lease_revision,
+            current_destination_resource: &request.destination_resource,
+            durable_source_authorization: DurableSourceAuthorization::Hint { revision: 1 },
+            nonce_already_used: false,
+            source_challenge: challenge,
+            lease_expires_at: None,
+            other_deadlines: &[],
+        }
+    }
+
+    #[test]
+    fn durable_authorized_hint_is_not_fresh_proof() {
+        let request = request();
+        assert_eq!(
+            evaluate_admission(&request, facts(&request, None)),
+            AdmissionDecision::Deny(AdmissionDeny::DurableAuthorizedIsNotProof)
+        );
+    }
+
+    #[test]
+    fn matching_challenge_allows_only_until_the_shorter_deadline() {
+        let request = request();
+        let mut challenge = challenge(&request);
+        challenge.deadline = 180;
+        assert_eq!(
+            evaluate_admission(&request, facts(&request, Some(&challenge))),
+            AdmissionDecision::Allow { deadline: 180 }
+        );
+    }
+
+    #[test]
+    fn reused_nonce_suspended_peer_and_mismatch_deny() {
+        let request = request();
+        let challenge = challenge(&request);
+        let mut used = facts(&request, Some(&challenge));
+        used.nonce_already_used = true;
+        assert_eq!(
+            evaluate_admission(&request, used),
+            AdmissionDecision::Deny(AdmissionDeny::ReusedNonce)
+        );
+        let mut suspended = facts(&request, Some(&challenge));
+        suspended.peer = PeerState::Suspended;
+        assert_eq!(
+            evaluate_admission(&request, suspended),
+            AdmissionDecision::Deny(AdmissionDeny::PeerNotActive)
+        );
+        let mut other_audience = challenge.clone();
+        other_audience.audience = "elsewhere".into();
+        assert_eq!(
+            evaluate_admission(&request, facts(&request, Some(&other_audience))),
+            AdmissionDecision::Deny(AdmissionDeny::ChallengeMismatch)
+        );
+    }
+
+    #[test]
+    fn withdrawal_and_unreadiness_deny() {
+        let request = request();
+        let challenge = challenge(&request);
+        let mut withdrawn = facts(&request, Some(&challenge));
+        withdrawn.durable_source_authorization = DurableSourceAuthorization::Withdrawn { revision: 2 };
+        assert_eq!(
+            evaluate_admission(&request, withdrawn),
+            AdmissionDecision::Deny(AdmissionDeny::SourceWithdrawn)
+        );
+        let mut not_ready = facts(&request, Some(&challenge));
+        not_ready.relationship_ready = false;
+        assert_eq!(
+            evaluate_admission(&request, not_ready),
+            AdmissionDecision::Deny(AdmissionDeny::NotReady)
+        );
+    }
+
+    #[test]
+    fn admission_wire_rejects_unknown_fields_and_names_a_deny_reason() {
+        let request = request();
+        let raw = admission_call_json(&LiveAdmissionCall {
+            source_platform: platform("provider-a"),
+            source_authorization: challenge(&request),
+            request,
+        }).unwrap();
+        let parsed = parse_admission_request(&raw).unwrap();
+        assert_eq!(parsed.request.operation, "a2a.invoke");
+        let mut unknown = String::from_utf8(raw).unwrap();
+        unknown.pop();
+        unknown.push_str(",\"task\":\"send\"}");
+        assert_eq!(
+            parse_admission_request(unknown.as_bytes()),
+            Err(AdmissionParseError::InvalidJson)
+        );
+        assert!(admission_response_json(&AdmissionDecision::Allow { deadline: 180 })
+            .contains("\"result\":\"ALLOW\""));
+        assert!(admission_response_json(&AdmissionDecision::Deny(AdmissionDeny::ReusedNonce))
+            .contains("REUSED_NONCE"));
+    }
+
+    #[test]
+    fn a_long_lease_cannot_issue_a_long_admission() {
+        let mut request = request();
+        request.deadline = 150 + 60;
+        let mut challenge = challenge(&request);
+        challenge.deadline = request.deadline;
+        let short_cap = [150 + 60];
+        let mut facts = facts(&request, Some(&challenge));
+        facts.lease_expires_at = Some(150 + 30 * 24 * 60 * 60);
+        facts.other_deadlines = &short_cap;
+        assert_eq!(
+            evaluate_admission(&request, facts.clone()),
+            AdmissionDecision::Allow {
+                deadline: short_cap[0]
+            }
+        );
+        let mut until_revoked = facts.clone();
+        until_revoked.lease_expires_at = None;
+        assert_eq!(
+            evaluate_admission(&request, until_revoked),
+            AdmissionDecision::Allow {
+                deadline: short_cap[0]
+            }
+        );
+        let mut expired = facts;
+        expired.now = request.deadline;
+        assert_eq!(
+            evaluate_admission(&request, expired),
+            AdmissionDecision::Deny(AdmissionDeny::StaleDeadline)
+        );
+    }
 }

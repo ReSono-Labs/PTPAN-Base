@@ -172,6 +172,40 @@ pub struct ConfigAckPayload {
     pub configuration_revision: u64,
     pub key_purpose_revision: u64,
     pub acknowledged_at: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub source_key: Option<SourceKeyBinding>,
+}
+
+/// An authenticated source provider's account-host assertion. The public
+/// admission key remains separate from its SPIFFE service identity. The
+/// destination host scopes this binding to its own account and grant; key
+/// possession is checked by the host's admission proof path.
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct SourceKeyBinding {
+    pub source_subject: OpaqueId,
+    pub source_resource: OpaqueId,
+    pub destination_subject: OpaqueId,
+    pub destination_resource: OpaqueId,
+    pub terms_digest: String,
+    pub key_purpose: String,
+    pub public_key: String,
+}
+
+impl SourceKeyBinding {
+    pub fn matches_approved_lease(
+        &self,
+        request: &RelationshipRequest,
+        lease: &RelationshipLease,
+        destination: &Participant,
+    ) -> bool {
+        self.source_subject == request.source.subject_id
+            && self.source_resource == request.source.resource_id
+            && self.destination_subject == destination.subject_id
+            && self.destination_resource == destination.resource_id
+            && self.terms_digest == hex(&lease.terms_digest)
+            && self.key_purpose == "ed25519_admission"
+    }
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -186,6 +220,7 @@ pub enum ControlPayload {
 
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct ControlEvent {
+    pub schema: String,
     pub event_id: OpaqueId,
     pub sender_platform_id: PlatformId,
     pub recipient_platform_id: PlatformId,
@@ -246,7 +281,8 @@ pub fn parse_control_event(
         return Err(ControlError::TooLarge);
     }
     let raw: RawEvent = serde_json::from_slice(bytes).map_err(|_| ControlError::InvalidJson)?;
-    if raw.schema != "federation-control/v1" {
+    if (raw.schema != "federation-control/v1" && raw.schema != "federation-control/v2")
+        || (raw.schema == "federation-control/v2" && raw.kind != EventKind::ConfigAck) {
         return Err(ControlError::InvalidSchema);
     }
     if &raw.sender_platform_id != authenticated_sender
@@ -365,6 +401,25 @@ pub fn parse_control_event(
                 return Err(ControlError::InvalidField);
             }
             utc_timestamp(&p.acknowledged_at).map_err(|_| ControlError::InvalidField)?;
+            if raw.schema == "federation-control/v1" && p.source_key.is_some() {
+                return Err(ControlError::InvalidSchema);
+            }
+            if raw.schema == "federation-control/v2" {
+                match raw.actor_side {
+                    ActorSide::Source => {
+                        let binding = p.source_key.as_ref().ok_or(ControlError::InvalidBinding)?;
+                        if binding.key_purpose != "ed25519_admission"
+                            || decode_digest(&binding.terms_digest).is_err()
+                            || binding.public_key.len() != 64
+                            || !binding.public_key.bytes().all(|c| c.is_ascii_digit() || (b'a'..=b'f').contains(&c))
+                        { return Err(ControlError::InvalidField); }
+                    }
+                    ActorSide::Destination if p.source_key.is_some() => {
+                        return Err(ControlError::InvalidBinding);
+                    }
+                    ActorSide::Destination => {}
+                }
+            }
         }
     }
     let value: serde_json::Value =
@@ -374,6 +429,7 @@ pub fn parse_control_event(
     let body_digest = Sha256::digest(&canonical_bytes).into();
     Ok(ParsedControlEvent {
         event: ControlEvent {
+            schema: raw.schema,
             event_id: raw.event_id,
             sender_platform_id: raw.sender_platform_id,
             recipient_platform_id: raw.recipient_platform_id,
@@ -470,4 +526,92 @@ pub fn parse_receipt(bytes: &[u8]) -> Result<ControlReceipt, ControlError> {
     }
     decode_digest(&receipt.body_digest)?;
     Ok(receipt)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    #[test]
+    fn strict_status_wire_rejects_spoof_duplicate_and_unknown() {
+        let raw = br#"{"schema":"federation-control/v1","event_id":"e1","kind":"RELATIONSHIP_STATUS","sender_platform_id":"provider-a","recipient_platform_id":"provider-b","originating_platform_id":"provider-a","relationship_id":"r1","request_id":null,"actor_side":"SOURCE","actor_revision":1,"created_at":"2026-09-23T08:00:00Z","delivery_expires_at":"2026-09-23T08:01:00Z","payload":{"lease_id":"l1","lease_revision":1,"state":"READY","observed_at":"2026-09-23T08:00:00Z"}}"#;
+        let a = PlatformId::new("provider-a").unwrap();
+        let b = PlatformId::new("provider-b").unwrap();
+        let parsed = parse_control_event(raw, &a, &b).unwrap();
+        assert_eq!(parsed.exact_bytes, raw);
+        assert_ne!(parsed.body_digest, [0; 32]);
+        assert_eq!(
+            parse_control_event(raw, &b, &a),
+            Err(ControlError::WrongPeer)
+        );
+        let changed = String::from_utf8(raw.to_vec()).unwrap().replace(
+            "\"state\":\"READY\"",
+            "\"state\":\"READY\",\"state\":\"REVOKED\"",
+        );
+        assert_eq!(
+            parse_control_event(changed.as_bytes(), &a, &b),
+            Err(ControlError::InvalidJson)
+        );
+        let changed = String::from_utf8(raw.to_vec()).unwrap().replace(
+            "\"observed_at\":",
+            "\"account_inventory\":[],\"observed_at\":",
+        );
+        assert_eq!(
+            parse_control_event(changed.as_bytes(), &a, &b),
+            Err(ControlError::InvalidJson)
+        );
+    }
+
+    #[test]
+    fn control_schema_names_the_six_kinds_and_forbids_extra_fields() {
+        let schema = include_str!("../../../schemas/control-event-v1.json");
+        let value: serde_json::Value = serde_json::from_str(schema).unwrap();
+        assert_eq!(value["$id"], "federation-control/v1");
+        assert_eq!(value["additionalProperties"], false);
+        let kinds = value["properties"]["kind"]["enum"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|item| item.as_str().unwrap())
+            .collect::<Vec<_>>();
+        assert_eq!(
+            kinds,
+            [
+                "RELATIONSHIP_REQUEST",
+                "RELATIONSHIP_DECISION",
+                "RELATIONSHIP_REVOKE",
+                "RELATIONSHIP_STATUS",
+                "SOURCE_AUTHORIZATION_STATUS",
+                "CONFIG_ACK"
+            ]
+        );
+        assert!(schema.contains("\"additionalProperties\": false"));
+        assert!(!schema.contains("account_inventory"));
+    }
+
+    #[test]
+    fn source_key_ack_requires_v2_and_exact_purpose() {
+        let mut body = serde_json::json!({
+            "schema":"federation-control/v2","event_id":"key-ack-1","kind":"CONFIG_ACK",
+            "sender_platform_id":"provider-a","recipient_platform_id":"provider-b",
+            "originating_platform_id":"provider-a","relationship_id":"relationship-1",
+            "request_id":null,"actor_side":"SOURCE","actor_revision":1,
+            "created_at":"2026-09-23T08:00:00Z","delivery_expires_at":"2026-09-23T08:01:00Z",
+            "payload":{"lease_id":"lease-1","lease_revision":1,"configuration_revision":1,
+                "key_purpose_revision":1,"acknowledged_at":"2026-09-23T08:00:00Z",
+                "source_key":{"source_subject":"account-1","source_resource":"agent-1",
+                    "destination_subject":"account-2","destination_resource":"agent-2",
+                    "terms_digest":"aa".repeat(32),"key_purpose":"ed25519_admission",
+                    "public_key":"bb".repeat(32)}}
+        });
+        let a = PlatformId::new("provider-a").unwrap();
+        let b = PlatformId::new("provider-b").unwrap();
+        assert!(parse_control_event(&serde_json::to_vec(&body).unwrap(), &a, &b).is_ok());
+        body["schema"] = "federation-control/v1".into();
+        assert_eq!(parse_control_event(&serde_json::to_vec(&body).unwrap(), &a, &b), Err(ControlError::InvalidSchema));
+        body["schema"] = "federation-control/v2".into();
+        body["payload"]["source_key"]["key_purpose"] = "spiffe".into();
+        assert_eq!(parse_control_event(&serde_json::to_vec(&body).unwrap(), &a, &b), Err(ControlError::InvalidField));
+        body["payload"].as_object_mut().unwrap().remove("source_key");
+        assert_eq!(parse_control_event(&serde_json::to_vec(&body).unwrap(), &a, &b), Err(ControlError::InvalidBinding));
+    }
 }

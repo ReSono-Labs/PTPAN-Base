@@ -542,3 +542,157 @@ pub fn local_owner_consent(
 fn hex(bytes: &[u8]) -> String {
     bytes.iter().map(|byte| format!("{byte:02x}")).collect()
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::{Direction, LifetimeRequest, PendingTarget, RequestKind};
+    use std::collections::BTreeSet;
+
+    fn platform(value: &str) -> PlatformId {
+        PlatformId::new(value).unwrap()
+    }
+
+    fn id(value: &str) -> OpaqueId {
+        OpaqueId::new(value).unwrap()
+    }
+
+    fn request() -> RelationshipRequest {
+        RelationshipRequest {
+            relationship_id: id("relationship-a-b"),
+            request_id: id("request-1"),
+            direction: Direction::new(platform("a"), platform("b")).unwrap(),
+            source: Participant {
+                platform_id: platform("a"),
+                subject_id: id("a-account"),
+                resource_id: id("a-agent"),
+            },
+            source_ownership_revision: 1,
+            request_kind: RequestKind::Establish,
+            request_revision: 1,
+            base_lease_revision: None,
+            application_protocol: "a2a".into(),
+            transport: "https".into(),
+            target: PendingTarget {
+                destination_platform_id: platform("b"),
+                full_agent_address: "calendar.someuser.providerb.example".into(),
+            },
+            requested_permissions: BTreeSet::from(["a2a.invoke".into()]),
+            requested_lifetime: LifetimeRequest::Fixed { expires_at: 3000 },
+            created_at: 1000,
+            request_expires_at: 1200,
+        }
+    }
+
+    #[test]
+    fn sent_record_stays_on_the_local_source_account() {
+        let request = request();
+        assert!(recorded_sent_is_local(&request, &platform("a"), &id("a-account"), 1).is_ok());
+        assert_eq!(
+            recorded_sent_is_local(&request, &platform("a"), &id("other"), 1),
+            Err(ExchangeRuleError::SourceNotAuthorized)
+        );
+        assert_eq!(
+            same_request_snapshot(Some("{\"id\":1}"), "{\"id\":2}"),
+            Err(ExchangeRuleError::DuplicateConflict)
+        );
+        assert!(same_request_snapshot(Some("same"), "same").unwrap());
+    }
+
+    #[test]
+    fn identical_control_bytes_replay_and_changed_bytes_conflict() {
+        assert_eq!(
+            replay_request_control(1, &[1; 32], "queued", 1, &[1; 32]).unwrap(),
+            RequestDeliveryResult::QueuedForLocalOwner
+        );
+        assert_eq!(
+            replay_request_control(1, &[1; 32], "address_not_recognized", 1, &[1; 32]).unwrap(),
+            RequestDeliveryResult::AddressNotRecognized
+        );
+        assert_eq!(
+            replay_request_control(1, &[1; 32], "queued", 1, &[2; 32]),
+            Err(ExchangeRuleError::DuplicateConflict)
+        );
+        assert_eq!(
+            replay_ingress_receipt("snap", "queued", "snap").unwrap(),
+            IngressReplay::Queued
+        );
+        assert!(replay_applied_control(1, &[1; 32], "applied", 1, &[1; 32]).is_ok());
+        assert_eq!(
+            replay_applied_control(1, &[1; 32], "queued", 1, &[1; 32]),
+            Err(ExchangeRuleError::DuplicateConflict)
+        );
+    }
+
+    #[test]
+    fn denial_and_expired_owner_action_create_no_grant_path() {
+        assert_eq!(
+            local_owner_consent(false, true, 1, 5, true),
+            Err(ExchangeRuleError::NotCurrentOwner)
+        );
+        assert_eq!(
+            local_owner_consent(true, true, 5, 5, true),
+            Err(ExchangeRuleError::DecisionExpired)
+        );
+        assert_eq!(
+            commit_owner_denial(OwnerDenialFacts {
+                actor_is_owner: true,
+                pending: true,
+                now: 1,
+                expiry: 5,
+                snapshot_matches: true,
+                current_owner_matches: true,
+            }),
+            Ok(())
+        );
+        assert_eq!(
+            commit_owner_approval(OwnerApprovalFacts {
+                actor_is_owner: true,
+                agent_matches: true,
+                revision_matches: true,
+                pending: false,
+                decision_already_set: false,
+                now: 1,
+                expiry: 5,
+                current_owner_matches: true,
+                snapshot_matches: true,
+            }),
+            Err(ExchangeRuleError::NotCurrentOwner)
+        );
+    }
+
+    #[test]
+    fn source_receipt_replay_must_repeat_the_same_result() {
+        let local = platform("a");
+        let receipt = ControlReceipt {
+            schema: "federation-receipt/v1".into(),
+            sender_platform_id: local.clone(),
+            recipient_platform_id: platform("b"),
+            event_id: id("event-1"),
+            body_digest: hex(&[9; 32]),
+            result: ReceiptResult::QueuedForLocalOwner,
+        };
+        assert_eq!(
+            plan_source_control_receipt(&receipt, &local, "b", 1, &[9; 32], 1, "queued", None)
+                .unwrap(),
+            SourceReceiptPlan::Commit {
+                receipt_result: "queued_for_local_owner",
+                sent_state: "delivered",
+            }
+        );
+        assert_eq!(
+            plan_source_control_receipt(
+                &receipt,
+                &local,
+                "b",
+                1,
+                &[9; 32],
+                1,
+                "committed",
+                Some("address_not_recognized")
+            ),
+            Err(ExchangeRuleError::ReceiptMismatch)
+        );
+        assert!(destination_receipt_is_applied(&receipt, &local).is_err());
+    }
+}

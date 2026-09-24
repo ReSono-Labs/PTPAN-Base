@@ -53,3 +53,81 @@ pub fn other_peers_remain_queued(queued: &[PlatformId], failed: &PlatformId) -> 
         .cloned()
         .collect()
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn platform(value: &str) -> PlatformId {
+        PlatformId::new(value).unwrap()
+    }
+
+    fn routes() -> Vec<ServiceRoute> {
+        vec![
+            ServiceRoute {
+                service_id: "spiffe://provider-b.test/federation/control".into(),
+                platform_id: platform("provider-b"),
+            },
+            ServiceRoute {
+                service_id: "spiffe://provider-c.test/federation/control".into(),
+                platform_id: platform("provider-c"),
+            },
+        ]
+    }
+
+    #[test]
+    fn authenticated_service_selects_its_platform_only() {
+        let routes = routes();
+        assert_eq!(
+            select_peer(
+                "spiffe://provider-c.test/federation/control",
+                &platform("provider-c"),
+                &routes
+            )
+            .unwrap(),
+            platform("provider-c")
+        );
+        assert_eq!(
+            select_peer(
+                "spiffe://provider-c.test/federation/control",
+                &platform("provider-b"),
+                &routes
+            ),
+            Err(RouteError::ClaimedIdentityMismatch)
+        );
+        assert_eq!(
+            select_peer("spiffe://link-d.test/federation/control", &platform("link-d"), &routes),
+            Err(RouteError::UnknownService)
+        );
+    }
+
+    #[test]
+    fn duplicate_service_binding_is_rejected() {
+        let mut routes = routes();
+        routes.push(ServiceRoute {
+            service_id: "spiffe://provider-c.test/federation/control".into(),
+            platform_id: platform("provider-c"),
+        });
+        assert_eq!(
+            select_peer(
+                "spiffe://provider-c.test/federation/control",
+                &platform("provider-c"),
+                &routes
+            ),
+            Err(RouteError::AmbiguousService)
+        );
+    }
+
+    #[test]
+    fn failure_of_one_peer_leaves_the_other_queued() {
+        let queued = [platform("provider-b"), platform("provider-c")];
+        assert_eq!(
+            other_peers_remain_queued(&queued, &platform("provider-b")),
+            vec![platform("provider-c")]
+        );
+        assert_eq!(
+            other_peers_remain_queued(&queued, &platform("provider-c")),
+            vec![platform("provider-b")]
+        );
+    }
+}

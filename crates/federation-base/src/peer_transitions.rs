@@ -428,3 +428,190 @@ pub fn regrant_transition(
         Ok(())
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn prior(removed: bool) -> CandidatePrior<'static> {
+        CandidatePrior {
+            revision: 2,
+            digest: &[1; 32],
+            service: "spiffe://peer/control",
+            removed,
+        }
+    }
+
+    #[test]
+    fn candidate_reset_requires_a_new_revision_and_live_peer() {
+        assert_eq!(
+            plan_candidate(None, 1, &[1; 32], "spiffe://peer/control").unwrap(),
+            CandidatePlan::Insert
+        );
+        assert_eq!(
+            plan_candidate(Some(prior(false)), 2, &[1; 32], "spiffe://peer/control").unwrap(),
+            CandidatePlan::Unchanged
+        );
+        assert_eq!(
+            plan_candidate(Some(prior(false)), 3, &[1; 32], "spiffe://peer/control").unwrap(),
+            CandidatePlan::AdvanceRevision
+        );
+        assert_eq!(
+            plan_candidate(Some(prior(false)), 3, &[2; 32], "spiffe://peer/control").unwrap(),
+            CandidatePlan::ResetApprovals
+        );
+        assert_eq!(
+            plan_candidate(Some(prior(false)), 2, &[2; 32], "spiffe://peer/control"),
+            Err(PeerRuleError::ManifestMismatch)
+        );
+        assert_eq!(
+            plan_candidate(Some(prior(true)), 3, &[2; 32], "spiffe://peer/control"),
+            Err(PeerRuleError::InvalidTransition)
+        );
+        assert_eq!(
+            plan_candidate(None, 0, &[1; 32], "spiffe://peer/control"),
+            Err(PeerRuleError::InvalidTransition)
+        );
+    }
+
+    #[test]
+    fn hello_replay_returns_the_saved_result_and_rejects_altered_bytes() {
+        let prior = PriorInbox {
+            sender: "peer",
+            body_digest: &[1; 32],
+            exact_bytes: b"same",
+            generation: 1,
+            result: "CANDIDATE_SAVED",
+        };
+        assert_eq!(
+            classify_peer_inbox(Some(prior), "peer", &[1; 32], b"same", 1).unwrap(),
+            InboxReplay::Same("CANDIDATE_SAVED")
+        );
+        assert_eq!(
+            classify_peer_inbox(Some(prior), "peer", &[1; 32], b"changed", 1),
+            Err(PeerRuleError::DuplicateMessageConflict)
+        );
+        assert_eq!(
+            accept_hello_generation(None, 2),
+            Err(PeerRuleError::InvalidTransition)
+        );
+        assert_eq!(accept_hello_generation(None, 1), Ok(()));
+    }
+
+    #[test]
+    fn trust_request_admits_only_pending_delivery_capability() {
+        let caps = BTreeSet::from(["REQUEST_DELIVERY".to_owned()]);
+        assert_eq!(
+            trust_request_matches(
+                &[1; 32],
+                Some([1; 32]),
+                &[2; 32],
+                Some([2; 32]),
+                &caps,
+                true,
+                true
+            ),
+            Ok(())
+        );
+        assert_eq!(
+            trust_request_matches(
+                &[1; 32],
+                Some([1; 32]),
+                &[2; 32],
+                Some([2; 32]),
+                &caps,
+                false,
+                true
+            ),
+            Err(PeerRuleError::ManifestMismatch)
+        );
+        assert_eq!(
+            trust_request_matches(
+                &[1; 32],
+                Some([1; 32]),
+                &[2; 32],
+                Some([2; 32]),
+                &caps,
+                true,
+                false
+            ),
+            Err(PeerRuleError::InvalidTransition)
+        );
+        assert_eq!(
+            remote_trust_decision(
+                Some([1; 32]),
+                &[1; 32],
+                Some([2; 32]),
+                &[2; 32],
+                TrustDecisionResult::Rejected,
+                &BTreeSet::new()
+            )
+            .unwrap(),
+            RemoteTrustWrite::Reject
+        );
+        assert_eq!(
+            remote_trust_decision(
+                Some([1; 32]),
+                &[1; 32],
+                Some([2; 32]),
+                &[2; 32],
+                TrustDecisionResult::Approved,
+                &BTreeSet::from(["REQUEST_DELIVERY".to_owned(), "ACCOUNT_LIST".to_owned()])
+            ),
+            Err(PeerRuleError::InvalidTransition)
+        );
+    }
+
+    #[test]
+    fn active_gate_requires_every_flag_and_fresh_identity() {
+        assert_eq!(
+            next_pending_state(true, true, true, true),
+            PeerState::Active
+        );
+        assert_eq!(
+            next_pending_state(true, true, false, true),
+            PeerState::Pending
+        );
+        let active = PeerRequestGate {
+            state: PeerState::Active,
+            local_operator_approved: true,
+            remote_operator_approval_confirmed: true,
+            peer_identity_verified: true,
+            exact_service_authenticated: true,
+        };
+        let stale = apply_evidence_freshness(active.clone(), false);
+        assert!(!stale.peer_identity_verified);
+        assert_eq!(stale.state, PeerState::Pending);
+        assert!(!stale.permits_request_delivery());
+        assert!(apply_evidence_freshness(active, true).permits_request_delivery());
+    }
+
+    #[test]
+    fn removal_blocks_requests_and_regrant_starts_only_from_removed() {
+        assert_eq!(
+            trust_request_may_be_recorded(true),
+            Err(PeerRuleError::InvalidTransition)
+        );
+        assert_eq!(
+            regrant_transition(Some((1, PeerState::Removed)), 2, "spiffe://peer/control"),
+            Ok(())
+        );
+        assert_eq!(
+            regrant_transition(Some((1, PeerState::Active)), 2, "spiffe://peer/control"),
+            Err(PeerRuleError::InvalidTransition)
+        );
+        assert_eq!(
+            suspend_transition(Some(PeerState::Pending)),
+            Err(PeerRuleError::InvalidTransition)
+        );
+        assert_eq!(
+            inbound_operator_may_decide(InboundDecisionFacts {
+                pending: true,
+                digest_matches: true,
+                removed_or_suspended: false,
+                expiry_still_valid: Some(false),
+            }),
+            Err(PeerRuleError::InvalidTransition)
+        );
+    }
+}

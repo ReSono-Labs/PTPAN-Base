@@ -923,3 +923,169 @@ pub fn target_address_in_provider_domain(address: &str, domain: &str) -> bool {
             .strip_suffix(domain)
             .is_some_and(|prefix| prefix.ends_with('.') && prefix.len() > 1)
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::provider_manifest::parse_manifest;
+
+    #[test]
+    fn domain_key_service_and_bootstrap_must_all_match() {
+        let hello: serde_json::Value =
+            serde_json::from_str(include_str!("../../../fixtures/peer/provider-a-hello.json")).unwrap();
+        let mut manifest = hello["payload"]["manifest"].clone();
+        let name = "http://provider-a.test:8080/providers/test-1";
+        manifest["discovery"]["domain_proof_ref"] = serde_json::json!(name);
+        manifest["discovery"]["publisher_name_ref"] = serde_json::json!(name);
+        manifest["discovery"]["record_cids"] = serde_json::json!(["bafy-test-cid"]);
+        let snapshot = parse_manifest(&serde_json::to_vec(&manifest).unwrap()).unwrap();
+        let bootstrap = BootstrapAuthority {
+            peer: PlatformId::new("provider-a").unwrap(),
+            provider_domain: "provider-a.test".into(),
+            expected_control_service_id: "spiffe://provider-a.test/federation/control".into(),
+            expected_control_endpoint: "https://provider-a-bridge:8444/control".into(),
+            expected_directory_endpoint: "https://directory.provider-a.test".into(),
+            expected_local_directory_service_id: "spiffe://provider-b.test/directory/server".into(),
+            expected_bundle_endpoint: "https://bundle.provider-a.test".into(),
+            expected_bundle_profile: "https_spiffe".into(),
+            max_evidence_age_seconds: 7200,
+        };
+        let evidence = DirectoryNameEvidence {
+            record_cid: "bafy-test-cid".into(),
+            record_name: name.into(),
+            verified: true,
+            domain: "provider-a.test:8080".into(),
+            method: "wellknown".into(),
+            key_id: "test-key".into(),
+            verified_at: "2026-09-23T08:00:00Z".into(),
+            source_directory_service_id: "spiffe://provider-b.test/directory/server".into(),
+        };
+        let now = unix_seconds(utc_timestamp("2026-09-23T09:00:00Z").unwrap());
+        assert_eq!(
+            unix_seconds(utc_timestamp("1970-01-01T00:00:00Z").unwrap()),
+            0
+        );
+        let binding = verify_provider_binding(
+            &snapshot,
+            &bootstrap,
+            &bootstrap.expected_control_service_id,
+            &evidence,
+            EvidenceProfile::LocalHttpTest,
+            now,
+        )
+        .unwrap();
+        assert_eq!(binding.manifest_digest(), snapshot.digest);
+        assert!(binding.observations().iter().any(|observation| {
+            observation.field_path == "platform.operator_name"
+                && observation.result == ObservationResult::SelfDeclared
+        }));
+        assert!(binding.observations().iter().any(|observation| {
+            observation.verified_property.as_deref() == Some("domain-key-control")
+                && observation.result == ObservationResult::Verified
+        }));
+        assert!(binding.observations().iter().any(|observation| {
+            observation.verified_property.as_deref() == Some("evidence-freshness")
+                && observation.result == ObservationResult::Verified
+                && observation.freshness_seconds.is_some()
+        }));
+        assert!(binding.observations().iter().all(|observation| {
+            observation.result != ObservationResult::Verified || observation.verified_property.is_some()
+        }));
+        let rejected = evaluate_provider_identity(
+            &snapshot,
+            &bootstrap,
+            "spiffe://provider-a.test/other",
+            &evidence,
+            EvidenceProfile::LocalHttpTest,
+            now,
+        );
+        assert_eq!(rejected.binding, Err(IdentityError::WrongService));
+        assert!(rejected.observations.iter().any(|observation| {
+            observation.field_path == "authenticated_control_service"
+                && observation.result == ObservationResult::Mismatch
+        }));
+        assert!(rejected.observations.iter().all(|observation| {
+            observation.verified_property.as_deref() != Some("domain-key-control")
+        }));
+        assert_eq!(
+            verify_provider_binding(
+                &snapshot,
+                &bootstrap,
+                &bootstrap.expected_control_service_id,
+                &evidence,
+                EvidenceProfile::ProductionHttps,
+                now
+            ),
+            Err(IdentityError::UnsupportedProfile)
+        );
+        let mut wrong = evidence.clone();
+        wrong.verified = false;
+        assert_eq!(
+            verify_provider_binding(
+                &snapshot,
+                &bootstrap,
+                &bootstrap.expected_control_service_id,
+                &wrong,
+                EvidenceProfile::LocalHttpTest,
+                now
+            ),
+            Err(IdentityError::UnverifiedName)
+        );
+        wrong = evidence.clone();
+        wrong.key_id = "".into();
+        assert_eq!(
+            verify_provider_binding(
+                &snapshot,
+                &bootstrap,
+                &bootstrap.expected_control_service_id,
+                &wrong,
+                EvidenceProfile::LocalHttpTest,
+                now
+            ),
+            Err(IdentityError::UnverifiedName)
+        );
+        assert_eq!(
+            verify_provider_binding(
+                &snapshot,
+                &bootstrap,
+                &bootstrap.expected_control_service_id,
+                &evidence,
+                EvidenceProfile::LocalHttpTest,
+                now + 7201
+            ),
+            Err(IdentityError::StaleOrInvalidEvidence)
+        );
+        assert_eq!(
+            verify_provider_binding(
+                &snapshot,
+                &bootstrap,
+                "spiffe://provider-a.test/other",
+                &evidence,
+                EvidenceProfile::LocalHttpTest,
+                now
+            ),
+            Err(IdentityError::WrongService)
+        );
+    }
+
+    #[test]
+    fn private_address_must_be_a_dns_child_of_the_selected_provider() {
+        assert!(target_address_in_provider_domain(
+            "agent.agents.provider-b.test",
+            "provider-b.test"
+        ));
+        for address in [
+            "provider-b.test",
+            "agent.provider-b.test.evil",
+            "agent.provider-c.test",
+            "AGENT.provider-b.test",
+            "agent..provider-b.test",
+            "-bad.provider-b.test",
+        ] {
+            assert!(
+                !target_address_in_provider_domain(address, "provider-b.test"),
+                "{address}"
+            );
+        }
+    }
+}

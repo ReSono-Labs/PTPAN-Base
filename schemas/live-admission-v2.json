@@ -1,0 +1,262 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "live-admission/v2",
+  "title": "Federation Base live admission",
+  "description": "Project-owned signed live admission request. The account-owned Ed25519 proof binds the exact source authorization and request; the response remains live-admission/v1. No destination credential or A2A task body is carried.",
+  "oneOf": [
+    {
+      "$ref": "#/$defs/request"
+    },
+    {
+      "$ref": "#/$defs/response"
+    }
+  ],
+  "$defs": {
+    "request": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "schema",
+        "source_platform",
+        "relationship_id",
+        "lease_id",
+        "lease_revision",
+        "source_subject",
+        "source_resource",
+        "destination_platform",
+        "destination_resource",
+        "caller_key_purpose",
+        "caller_key_revision",
+        "audience",
+        "challenge_nonce",
+        "operation",
+        "deadline",
+        "source_authorization"
+      ],
+      "properties": {
+        "schema": {
+          "const": "live-admission/v2"
+        },
+        "source_platform": {
+          "type": "string",
+          "minLength": 1,
+          "maxLength": 256
+        },
+        "relationship_id": {
+          "type": "string",
+          "minLength": 1,
+          "maxLength": 256
+        },
+        "lease_id": {
+          "type": "string",
+          "minLength": 1,
+          "maxLength": 256
+        },
+        "lease_revision": {
+          "type": "integer",
+          "minimum": 1
+        },
+        "source_subject": {
+          "type": "string",
+          "minLength": 1,
+          "maxLength": 256
+        },
+        "source_resource": {
+          "type": "string",
+          "minLength": 1,
+          "maxLength": 256
+        },
+        "destination_platform": {
+          "type": "string",
+          "minLength": 1,
+          "maxLength": 256
+        },
+        "destination_resource": {
+          "type": "string",
+          "minLength": 1,
+          "maxLength": 256
+        },
+        "caller_key_purpose": {
+          "type": "string",
+          "minLength": 1,
+          "maxLength": 256
+        },
+        "caller_key_revision": {
+          "type": "integer",
+          "minimum": 1
+        },
+        "audience": {
+          "type": "string",
+          "minLength": 1,
+          "maxLength": 256
+        },
+        "challenge_nonce": {
+          "type": "string",
+          "minLength": 1,
+          "maxLength": 256
+        },
+        "operation": {
+          "type": "string",
+          "minLength": 1,
+          "maxLength": 256
+        },
+        "deadline": {
+          "type": "integer",
+          "minimum": 1
+        },
+        "source_authorization": {
+          "$ref": "#/$defs/source_authorization"
+        }
+      }
+    },
+    "source_authorization": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "nonce",
+        "relationship_id",
+        "lease_revision",
+        "source_subject",
+        "source_resource",
+        "destination_platform",
+        "audience",
+        "caller_key_purpose",
+        "caller_key_revision",
+        "deadline",
+        "withdrawn",
+        "proof"
+      ],
+      "properties": {
+        "nonce": {
+          "type": "string",
+          "minLength": 1,
+          "maxLength": 256
+        },
+        "relationship_id": {
+          "type": "string",
+          "minLength": 1,
+          "maxLength": 256
+        },
+        "lease_revision": {
+          "type": "integer",
+          "minimum": 1
+        },
+        "source_subject": {
+          "type": "string",
+          "minLength": 1,
+          "maxLength": 256
+        },
+        "source_resource": {
+          "type": "string",
+          "minLength": 1,
+          "maxLength": 256
+        },
+        "destination_platform": {
+          "type": "string",
+          "minLength": 1,
+          "maxLength": 256
+        },
+        "audience": {
+          "type": "string",
+          "minLength": 1,
+          "maxLength": 256
+        },
+        "caller_key_purpose": {
+          "type": "string",
+          "minLength": 1,
+          "maxLength": 256
+        },
+        "caller_key_revision": {
+          "type": "integer",
+          "minimum": 1
+        },
+        "deadline": {
+          "type": "integer",
+          "minimum": 1
+        },
+        "withdrawn": {
+          "const": false
+        },
+        "proof": {
+          "type": "string",
+          "pattern": "^[0-9a-f]{128}$"
+        }
+      }
+    },
+    "response": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "schema",
+        "result"
+      ],
+      "properties": {
+        "schema": {
+          "const": "live-admission/v1"
+        },
+        "result": {
+          "enum": [
+            "ALLOW",
+            "DENY"
+          ]
+        },
+        "deadline": {
+          "type": "integer",
+          "minimum": 1
+        },
+        "reason": {
+          "enum": [
+            "PEER_NOT_ACTIVE",
+            "NOT_READY",
+            "GRANT_DENIED",
+            "REUSED_NONCE",
+            "STALE_DEADLINE",
+            "CHALLENGE_MISMATCH",
+            "SOURCE_WITHDRAWN",
+            "DURABLE_AUTHORIZED_IS_NOT_PROOF"
+          ]
+        }
+      },
+      "allOf": [
+        {
+          "if": {
+            "properties": {
+              "result": {
+                "const": "ALLOW"
+              }
+            }
+          },
+          "then": {
+            "required": [
+              "deadline"
+            ],
+            "not": {
+              "required": [
+                "reason"
+              ]
+            }
+          }
+        },
+        {
+          "if": {
+            "properties": {
+              "result": {
+                "const": "DENY"
+              }
+            }
+          },
+          "then": {
+            "required": [
+              "reason"
+            ],
+            "not": {
+              "required": [
+                "deadline"
+              ]
+            }
+          }
+        }
+      ]
+    }
+  }
+}

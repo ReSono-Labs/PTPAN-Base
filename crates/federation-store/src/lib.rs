@@ -82,9 +82,8 @@ pub trait PeerPolicyStore {
     fn binding(&self, peer: &PlatformId) -> Result<PeerBinding, Self::Error>;
 }
 
-/// Destination provider adapter for the currently implemented request and
-/// test-grant slice. Additional source authorization, admission, task-use,
-/// and lifecycle ports are still required by the working contracts.
+/// Destination provider adapter for private request delivery and enforceable
+/// grants. The provider supplies its own account and grant implementation.
 pub trait DestinationHostPort {
     type Error;
 

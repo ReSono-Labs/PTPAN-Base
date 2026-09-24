@@ -575,7 +575,7 @@ mod tests {
             transport: "https".into(),
             target: PendingTarget {
                 destination_platform_id: platform("b"),
-                full_agent_address: "calendar.someuser.providerb.example".into(),
+                full_agent_address: "0123456789abcdef.providerb.example".into(),
             },
             requested_permissions: BTreeSet::from(["a2a.invoke".into()]),
             requested_lifetime: LifetimeRequest::Fixed { expires_at: 3000 },

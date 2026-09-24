@@ -1156,6 +1156,40 @@ mod tests {
             ),
             Err(IdentityError::WrongService)
         );
+        manifest["workload_trust"]["control_service_role"] = serde_json::json!("DIRECTORY");
+        let wrong_role = parse_manifest(&serde_json::to_vec(&manifest).unwrap()).unwrap();
+        let role_rejected = evaluate_provider_identity(
+            &wrong_role,
+            &bootstrap,
+            &bootstrap.expected_control_service_id,
+            &evidence,
+            EvidenceProfile::LocalHttpTest,
+            now,
+        );
+        assert_eq!(role_rejected.binding, Err(IdentityError::WrongService));
+        assert!(role_rejected.observations.iter().any(|observation| {
+            observation.field_path == "workload_trust.control_service_role"
+                && observation.result == ObservationResult::Mismatch
+        }));
+        assert!(role_rejected.observations.iter().all(|observation| {
+            observation.verified_property.as_deref() != Some("domain-key-control")
+        }));
+        manifest["workload_trust"]["control_service_role"] = serde_json::json!("CONTROL");
+        manifest["workload_trust"]["trust_domain"] = serde_json::json!("other.test");
+        let wrong_domain = parse_manifest(&serde_json::to_vec(&manifest).unwrap()).unwrap();
+        let domain_rejected = evaluate_provider_identity(
+            &wrong_domain,
+            &bootstrap,
+            &bootstrap.expected_control_service_id,
+            &evidence,
+            EvidenceProfile::LocalHttpTest,
+            now,
+        );
+        assert_eq!(domain_rejected.binding, Err(IdentityError::WrongDomain));
+        assert!(domain_rejected.observations.iter().any(|observation| {
+            observation.field_path == "workload_trust.trust_domain"
+                && observation.result == ObservationResult::Mismatch
+        }));
     }
 
     #[test]

@@ -143,6 +143,8 @@ This profile does not publish private agents into a public catalog. It does not 
 
 ## Agent capabilities
 
-Agent-to-agent access and capabilities are a user-level responsibility. The person who runs the private agent chooses how that agent is built and what it is able to do. The platform's job is the connection: identify the other provider, carry one request to the owning account, and keep checking the lease, the grant, and each call.
+Agent behavior and capabilities are the responsibility of the agent owner and its framework. Cross-platform identity, authorization, admission, and connection security are the responsibility of the participating platforms.
 
-That split is the route for now. Later, an agent that opens an A2A connection outside its owner's own account may have to meet a stated standard of protections and protocols before a platform will accept it. The governance for that standard belongs with the private agent. Building that framework is not a platform product. A platform can make a conforming framework a condition of cross-account authorization, and it keeps checking that condition for as long as the relationship is in use.
+That split is the current route. Later, a platform may require an external agent to satisfy an accepted security profile before it allows a connection outside the owner's own account. PTPAN Base verifies and enforces that requirement. It does not define the agent sandbox, prompt-injection defenses, tool permissions, secret storage, or runtime isolation.
+
+The security framework and its governance remain outside PTPAN Base. Platforms may require conformance with an accepted framework as a condition of cross-platform access. PTPAN Base secures the road between agents. The owner and the agent's own framework decide how the agent is built.

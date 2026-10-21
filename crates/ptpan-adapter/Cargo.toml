@@ -1,0 +1,22 @@
+[package]
+name = "ptpan-adapter"
+version = "0.1.0"
+edition = "2021"
+rust-version = "1.85"
+license = "Apache-2.0"
+description = "PTPAN adapter runtime: peer store, exchange outbox and inbox, platform resolver, edge admission"
+
+[dependencies]
+federation-base = { path = "../federation-base" }
+federation-ipc = { path = "../federation-ipc" }
+ptpan-platform-api = { path = "../ptpan-platform-api" }
+deadpool-postgres = "=0.14.2"
+tokio-postgres = "=0.7.16"
+tokio = { version = "=1.54.0", features = ["rt-multi-thread", "macros", "time", "sync", "signal", "net"] }
+tonic = { version = "=0.13.1", default-features = false, features = ["transport", "router", "codegen", "prost"] }
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+
+[dev-dependencies]
+ed25519-dalek = "=2.2.0"
+ptpan-test-support = { path = "../ptpan-test-support" }

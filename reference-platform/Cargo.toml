@@ -1,0 +1,23 @@
+[package]
+name = "ptpan-reference-platform"
+version = "0.1.0"
+edition = "2021"
+rust-version = "1.85"
+license = "Apache-2.0"
+description = "Reference platform for PTPAN: implements PlatformService on SQLite. A fixture and conformance target, not a production platform."
+publish = false
+
+[dependencies]
+federation-base = { path = "../crates/federation-base" }
+ptpan-platform-api = { path = "../crates/ptpan-platform-api" }
+rusqlite = { version = "=0.40.2", default-features = false, features = ["bundled"] }
+tokio = { version = "=1.54.0", features = ["rt-multi-thread", "macros", "time", "net", "io-util", "sync"] }
+tonic = { version = "=0.13.1", default-features = false, features = ["transport", "router", "codegen", "prost"] }
+ed25519-dalek = "=2.2.0"
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+
+[dev-dependencies]
+ptpan-adapter = { path = "../crates/ptpan-adapter" }
+ptpan-test-support = { path = "../crates/ptpan-test-support" }
+ptpan-conformance = { path = "../crates/ptpan-conformance" }

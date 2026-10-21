@@ -1,0 +1,24 @@
+[package]
+name = "ptpan-platform-api"
+version = "0.1.0"
+edition = "2021"
+rust-version = "1.85"
+license = "Apache-2.0"
+description = "PTPAN adapter-platform gRPC API (ptpan.platform.v1) and its local transport"
+
+[dependencies]
+federation-base = { path = "../federation-base" }
+serde_json = "1"
+prost = "=0.13.5"
+tonic = { version = "=0.13.1", default-features = false, features = ["transport", "router", "codegen", "prost"] }
+tokio = { version = "=1.54.0", features = ["net", "rt"] }
+tokio-stream = { version = "=0.1.19", features = ["net"] }
+hyper-util = { version = "=0.1.21", features = ["tokio"] }
+tower = { version = "=0.5.3", default-features = false, features = ["util"] }
+
+[build-dependencies]
+protox = "=0.8.0"
+tonic-build = { version = "=0.13.1", default-features = false, features = ["prost"] }
+
+[dev-dependencies]
+tokio = { version = "=1.54.0", features = ["macros", "rt-multi-thread", "fs"] }

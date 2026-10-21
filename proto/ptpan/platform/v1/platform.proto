@@ -1,0 +1,364 @@
+// PTPAN adapter–platform API (D2). This file is the single normative
+// definition of the boundary between a platform and its own PTPAN adapter.
+// It describes behaviour, not storage: a platform implements it on top of its
+// own tables, identifiers and runtime.
+//
+// Wire payloads that cross between platforms (relationship requests,
+// decisions, lifecycle events) travel here as the exact JSON defined by
+// schemas/control-event-v3.json, so Base stays the one authority for their
+// shape and digests.
+//
+// Connection: a Unix socket with a peer-UID check by default; mutual TLS with
+// exact SPIFFE IDs when the adapter and platform run on different hosts.
+// Agent byte streams (egress and ingress) are not gRPC: they use the local
+// stream sockets with the D11 admission framing.
+syntax = "proto3";
+
+package ptpan.platform.v1;
+
+// ---------------------------------------------------------------------------
+// Implemented by the platform, called only by its own adapter.
+// ---------------------------------------------------------------------------
+service PlatformService {
+  // Identity and supported API versions (H1). Called on every connect.
+  rpc GetPlatformInfo(GetPlatformInfoRequest) returns (PlatformInfo);
+
+  // Cross-platform actions the platform committed in its own transactions
+  // (H15): new requests, decisions, revokes, withdrawals, blocks, applied
+  // configuration. Records stay readable until acknowledged.
+  rpc ReadHandoff(ReadHandoffRequest) returns (ReadHandoffResponse);
+  rpc AckHandoff(AckHandoffRequest) returns (AckHandoffResponse);
+
+  // Re-checks, at send time, that the requesting account still owns the
+  // requesting agent (H4).
+  rpc AuthorizeSource(AuthorizeSourceRequest) returns (AuthorizeSourceResponse);
+
+  // Hands an authenticated peer's request to the platform's internal
+  // resolver; the address is passed unchanged (H3, H6).
+  rpc DeliverInbound(DeliverInboundRequest) returns (DeliverInboundResponse);
+
+  // A peer's decision on one of this platform's requests (H5).
+  rpc ApplyDecision(ApplyDecisionRequest) returns (ApplyResponse);
+
+  // A peer's revoke, status, source authorization, configuration
+  // acknowledgment (including the requesting agent's admission key, H9) or
+  // pair-block status (D7).
+  rpc ApplyLifecycle(ApplyLifecycleRequest) returns (ApplyResponse);
+
+  // The peer's receipt for an event built from a hand-off record.
+  rpc ConfirmReceipt(ConfirmReceiptRequest) returns (ConfirmReceiptResponse);
+
+  // Requester-only notices on the Sent list (H5).
+  rpc RecordNotice(RecordNoticeRequest) returns (RecordNoticeResponse);
+
+  // Per-call admission (D4): read the current bound key, then decide
+  // atomically; AdmitCall rechecks the key revision.
+  rpc GetBoundKey(GetBoundKeyRequest) returns (GetBoundKeyResponse);
+  rpc AdmitCall(AdmitCallRequest) returns (AdmitCallResponse);
+}
+
+// ---------------------------------------------------------------------------
+// Implemented by the adapter, called only by its own platform.
+// ---------------------------------------------------------------------------
+service AdapterService {
+  // Hint that new hand-off records exist. Never needed for correctness.
+  rpc Wake(WakeRequest) returns (WakeResponse);
+  // Health per adapter component and per peer (principle 11).
+  rpc GetHealth(GetHealthRequest) returns (Health);
+  // Platform resolver (review 11.2): address domain to a verified, active
+  // peer, longest match first. Also returns the peer's agent CA root (D13).
+  rpc ResolveAddress(ResolveAddressRequest) returns (ResolveAddressResponse);
+  // Stateless policy calls backed by Base (D1). The adapter keeps nothing.
+  rpc ValidateRequest(ValidateRequestRequest) returns (ValidateRequestResponse);
+  rpc ComputeTermsDigest(ComputeTermsDigestRequest) returns (ComputeTermsDigestResponse);
+  rpc ComputeLease(ComputeLeaseRequest) returns (ComputeLeaseResponse);
+}
+
+// --- Versions -------------------------------------------------------------
+
+message GetPlatformInfoRequest {
+  repeated uint32 adapter_api_majors = 1;
+  repeated string adapter_features = 2;
+}
+
+message PlatformInfo {
+  string platform_id = 1;
+  // Lowercase ASCII (punycode) provider domain of every address it issues.
+  string provider_domain = 2;
+  repeated uint32 api_majors = 3;
+  repeated string features = 4;
+}
+
+// --- Hand-off queue -------------------------------------------------------
+
+enum ControlKind {
+  CONTROL_KIND_UNSPECIFIED = 0;
+  CONTROL_KIND_RELATIONSHIP_REQUEST = 1;
+  CONTROL_KIND_RELATIONSHIP_DECISION = 2;
+  CONTROL_KIND_RELATIONSHIP_REVOKE = 3;
+  CONTROL_KIND_RELATIONSHIP_STATUS = 4;
+  CONTROL_KIND_SOURCE_AUTHORIZATION_STATUS = 5;
+  CONTROL_KIND_CONFIG_ACK = 6;
+  CONTROL_KIND_PAIR_BLOCK_STATUS = 7;
+}
+
+enum ActorSide {
+  ACTOR_SIDE_UNSPECIFIED = 0;
+  ACTOR_SIDE_SOURCE = 1;
+  ACTOR_SIDE_DESTINATION = 2;
+}
+
+message HandoffRecord {
+  string handoff_id = 1;
+  // Monotonic position in the platform's queue.
+  uint64 cursor = 2;
+  ControlKind kind = 3;
+  // The peer the event goes to.
+  string peer_platform_id = 4;
+  // Empty only for PAIR_BLOCK_STATUS.
+  string relationship_id = 5;
+  string request_id = 6;
+  // The control-event payload, exactly as schemas/control-event-v3.json
+  // defines it for `kind`.
+  bytes payload_json = 7;
+  // RFC 3339 UTC time the platform committed the action.
+  string committed_at = 8;
+  // This platform's side of the relationship for this event.
+  ActorSide actor_side = 9;
+}
+
+message ReadHandoffRequest {
+  uint64 after_cursor = 1;
+  uint32 limit = 2;
+}
+
+message ReadHandoffResponse {
+  repeated HandoffRecord records = 1;
+}
+
+message AckHandoffRequest {
+  string handoff_id = 1;
+}
+
+message AckHandoffResponse {}
+
+// --- Source authority -----------------------------------------------------
+
+message AuthorizeSourceRequest {
+  string request_id = 1;
+}
+
+message AuthorizeSourceResponse {
+  bool authorized = 1;
+  uint64 ownership_revision = 2;
+}
+
+// --- Inbound --------------------------------------------------------------
+
+message DeliverInboundRequest {
+  string source_platform_id = 1;
+  string event_id = 2;
+  // A validated RelationshipRequest (schemas/control-event-v3.json).
+  bytes request_json = 3;
+}
+
+enum DeliveryResult {
+  DELIVERY_RESULT_UNSPECIFIED = 0;
+  DELIVERY_RESULT_QUEUED_FOR_LOCAL_OWNER = 1;
+  // Identical in content and timing for unknown, retired and blocked
+  // addresses (review 12.5).
+  DELIVERY_RESULT_ADDRESS_NOT_RECOGNIZED = 2;
+}
+
+message DeliverInboundResponse {
+  DeliveryResult result = 1;
+}
+
+message ApplyDecisionRequest {
+  string source_platform_id = 1;
+  string event_id = 2;
+  string request_id = 3;
+  bytes decision_json = 4;
+  // The destination platform's agent CA root from its verified manifest
+  // (D13) and its edge service ID, the audience of every admission proof
+  // the source agent signs for this relationship (D4).
+  string peer_agent_ca_root = 5;
+  string peer_edge_service_id = 6;
+}
+
+message ApplyLifecycleRequest {
+  string peer_platform_id = 1;
+  string event_id = 2;
+  ControlKind kind = 3;
+  string relationship_id = 4;
+  bytes payload_json = 5;
+}
+
+enum ApplyResult {
+  APPLY_RESULT_UNSPECIFIED = 0;
+  APPLY_RESULT_APPLIED = 1;
+  // Stale revision, unknown relationship or a value that does not match the
+  // platform's record. Nothing changed.
+  APPLY_RESULT_REJECTED = 2;
+}
+
+message ApplyResponse {
+  ApplyResult result = 1;
+}
+
+enum ReceiptResult {
+  RECEIPT_RESULT_UNSPECIFIED = 0;
+  RECEIPT_RESULT_QUEUED_FOR_LOCAL_OWNER = 1;
+  RECEIPT_RESULT_ADDRESS_NOT_RECOGNIZED = 2;
+  RECEIPT_RESULT_APPLIED = 3;
+  RECEIPT_RESULT_REJECTED = 4;
+}
+
+message ConfirmReceiptRequest {
+  string handoff_id = 1;
+  ReceiptResult result = 2;
+}
+
+message ConfirmReceiptResponse {}
+
+enum NoticeKind {
+  NOTICE_KIND_UNSPECIFIED = 0;
+  NOTICE_KIND_WAITING_FOR_DELIVERY = 1;
+  NOTICE_KIND_DELIVERED = 2;
+  NOTICE_KIND_NOT_RECOGNIZED = 3;
+  NOTICE_KIND_UNKNOWN_PROVIDER = 4;
+  NOTICE_KIND_PEER_NOT_ACTIVE = 5;
+  NOTICE_KIND_EXPIRED_UNDELIVERED = 6;
+  // The account no longer owns the requesting agent at send time.
+  NOTICE_KIND_SOURCE_NOT_AUTHORIZED = 7;
+}
+
+message RecordNoticeRequest {
+  string request_id = 1;
+  NoticeKind kind = 2;
+}
+
+message RecordNoticeResponse {}
+
+// --- Admission ------------------------------------------------------------
+
+message GetBoundKeyRequest {
+  string relationship_id = 1;
+}
+
+message GetBoundKeyResponse {
+  bool found = 1;
+  // did:key of the requesting agent's Ed25519 admission key.
+  string did_key = 2;
+  uint64 key_revision = 3;
+}
+
+message AdmitCallRequest {
+  string relationship_id = 1;
+  // The verified token's claims (live-admission/v3), as JSON.
+  bytes claims_json = 2;
+  uint64 verified_key_revision = 3;
+}
+
+message AdmitCallResponse {
+  bool allowed = 1;
+  // Unix seconds; set when allowed.
+  uint64 deadline = 2;
+  // live-admission/v3 deny reason; set when denied.
+  string reason = 3;
+}
+
+// --- Adapter service ------------------------------------------------------
+
+message WakeRequest {}
+message WakeResponse {}
+
+message GetHealthRequest {}
+
+enum ComponentState {
+  COMPONENT_STATE_UNSPECIFIED = 0;
+  COMPONENT_STATE_UP = 1;
+  COMPONENT_STATE_DOWN = 2;
+  COMPONENT_STATE_NOT_CONFIGURED = 3;
+}
+
+message ComponentHealth {
+  string component = 1;
+  ComponentState state = 2;
+  string detail = 3;
+}
+
+message PeerHealth {
+  string peer_platform_id = 1;
+  string peer_state = 2;
+  bool reachable = 3;
+  uint64 queued_events = 4;
+}
+
+message Health {
+  repeated ComponentHealth components = 1;
+  repeated PeerHealth peers = 2;
+}
+
+message ResolveAddressRequest {
+  string address = 1;
+}
+
+enum ResolveResult {
+  RESOLVE_RESULT_UNSPECIFIED = 0;
+  RESOLVE_RESULT_PEER = 1;
+  RESOLVE_RESULT_BAD_SYNTAX = 2;
+  RESOLVE_RESULT_UNKNOWN_PROVIDER = 3;
+  RESOLVE_RESULT_PEER_NOT_ACTIVE = 4;
+  RESOLVE_RESULT_OWN_PLATFORM = 5;
+}
+
+message ResolveAddressResponse {
+  ResolveResult result = 1;
+  string peer_platform_id = 2;
+  string agent_ca_root = 3;
+}
+
+message ValidateRequestRequest {
+  bytes request_json = 1;
+}
+
+message ValidateRequestResponse {
+  bool valid = 1;
+  string error = 2;
+}
+
+message ComputeTermsDigestRequest {
+  bytes request_json = 1;
+}
+
+message ComputeTermsDigestResponse {
+  string request_terms_digest = 1;
+  string error = 2;
+}
+
+message PersonName {
+  string given_name = 1;
+  string family_name = 2;
+}
+
+message ComputeLeaseRequest {
+  bytes request_json = 1;
+  string lease_id = 2;
+  uint64 lease_revision = 3;
+  string decision_id = 4;
+  // SINGLE_TASK, FIXED or UNTIL_REVOKED.
+  string mode = 5;
+  uint64 effective_from = 6;
+  // Zero for UNTIL_REVOKED.
+  uint64 expires_at = 7;
+  repeated string effective_permissions = 8;
+  uint64 destination_ownership_revision = 9;
+  PersonName destination_owner_name = 10;
+}
+
+message ComputeLeaseResponse {
+  // The lease as schemas/control-event-v3.json `lease`, with terms_digest.
+  bytes lease_json = 1;
+  string error = 2;
+}

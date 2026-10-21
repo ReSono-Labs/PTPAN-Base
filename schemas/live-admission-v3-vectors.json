@@ -1,0 +1,21 @@
+{
+  "profile": "live-admission-v3-known-answer",
+  "description": "Ed25519 is deterministic (RFC 8032), so this token is exact. A platform implementing signing in another language must reproduce it byte for byte from the seed and claims; verifiers must accept it.",
+  "seed_hex": "2a2a2a2a2a2a2a2a2a2a2a2a2a2a2a2a2a2a2a2a2a2a2a2a2a2a2a2a2a2a2a2a",
+  "kid": "did:key:z6MkgAnvkP45uNxwCKeNdt6wrYkEjpYX4f7Nrd8MQqFL8Fbn",
+  "claims": {
+    "iss": "provider-a",
+    "sub": "Team.Calendar-7.provider-a.test",
+    "aud": "spiffe://provider-b.test/federation/edge",
+    "iat": 1790000000,
+    "exp": 1790000060,
+    "jti": "5b0d2c1e-nonce",
+    "relationship_id": "rel-a-b-1",
+    "lease_id": "lease-b-1",
+    "lease_revision": 1,
+    "operation": "a2a.invoke",
+    "destination_address": "0123456789abcdef.provider-b.test",
+    "key_revision": 1
+  },
+  "token": "eyJhbGciOiJFZDI1NTE5IiwidHlwIjoicHRwYW4tYWRtaXNzaW9uK2p3dCIsImtpZCI6ImRpZDprZXk6ejZNa2dBbnZrUDQ1dU54d0NLZU5kdDZ3cllrRWpwWVg0ZjdOcmQ4TVFxRkw4RmJuIn0.eyJpc3MiOiJwcm92aWRlci1hIiwic3ViIjoiVGVhbS5DYWxlbmRhci03LnByb3ZpZGVyLWEudGVzdCIsImF1ZCI6InNwaWZmZTovL3Byb3ZpZGVyLWIudGVzdC9mZWRlcmF0aW9uL2VkZ2UiLCJpYXQiOjE3OTAwMDAwMDAsImV4cCI6MTc5MDAwMDA2MCwianRpIjoiNWIwZDJjMWUtbm9uY2UiLCJyZWxhdGlvbnNoaXBfaWQiOiJyZWwtYS1iLTEiLCJsZWFzZV9pZCI6ImxlYXNlLWItMSIsImxlYXNlX3JldmlzaW9uIjoxLCJvcGVyYXRpb24iOiJhMmEuaW52b2tlIiwiZGVzdGluYXRpb25fYWRkcmVzcyI6IjAxMjM0NTY3ODlhYmNkZWYucHJvdmlkZXItYi50ZXN0Iiwia2V5X3JldmlzaW9uIjoxfQ.jUgzAHrSbLIJ-XGsUId3_dBfkmXg1MRMZiiBYu8oBLZpCH-WtQMHP6TdtvNuE8F1zUjK18DjTWdKfgxiKKumCQ"
+}

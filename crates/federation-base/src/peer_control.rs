@@ -2,23 +2,26 @@
 //! Directory federation and SPIRE workload trust do not express business
 //! operator request/approval. They travel over exact-ID SPIFFE mTLS.
 
-use crate::provider_manifest::{parse_manifest, utc_timestamp, ManifestSnapshot};
+use crate::encoding::{canonical_digest, decode_hex32, hex_lower};
+use crate::provider_manifest::{parse_manifest, ManifestSnapshot};
+use crate::time::parse_utc;
 use crate::{OpaqueId, PlatformId, MAX_JCS_INTEGER};
 use serde::{Deserialize, Serialize};
 use serde_json::value::RawValue;
-use sha2::{Digest, Sha256};
 use std::collections::BTreeSet;
 
 pub const MAX_PEER_MESSAGE_BYTES: usize = 72 << 10;
+/// The only accepted peer-message schema.
+pub const PEER_SCHEMA: &str = "federation-peer/v2";
 
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
 #[serde(rename_all = "SCREAMING_SNAKE_CASE")]
 pub enum PeerKind {
     PeerHello,
-    TrustRequest,
     TrustDecision,
     TrustSuspend,
     TrustRemove,
+    ManifestPending,
 }
 
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
@@ -26,16 +29,6 @@ pub enum PeerKind {
 pub enum TrustDecisionResult {
     Approved,
     Rejected,
-}
-
-#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
-#[serde(deny_unknown_fields)]
-pub struct TrustRequestPayload {
-    pub request_id: OpaqueId,
-    pub sender_manifest_digest: String,
-    pub recipient_manifest_digest: String,
-    pub requested_capabilities: BTreeSet<String>,
-    pub expires_at: String,
 }
 
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
@@ -56,10 +49,19 @@ pub struct RestrictionPayload {
     pub effective_at: String,
 }
 
+/// A planned manifest revision announced before it takes effect (D8). Each
+/// receiving operator revalidates and approves it before `effective_at`;
+/// otherwise traffic stops at that time.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct PendingManifest {
+    pub manifest: ManifestSnapshot,
+    pub effective_at: String,
+}
+
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub enum PeerPayload {
     Hello(ManifestSnapshot),
-    Request(TrustRequestPayload),
+    ManifestPending(PendingManifest),
     Decision(TrustDecisionPayload),
     Suspend(RestrictionPayload),
     Remove(RestrictionPayload),
@@ -118,19 +120,19 @@ pub fn parse_peer_receipt(
     }
     if receipt.generation != sent.message.generation
         || receipt.message_id != sent.message.message_id
-        || receipt.body_digest != hex_digest(&sent.body_digest)
+        || receipt.body_digest != hex_lower(&sent.body_digest)
         || !matches!(
             receipt.result.as_str(),
-            "CANDIDATE_SAVED" | "REQUEST_QUEUED" | "DECISION_RECORDED" | "SUSPENDED" | "REMOVED"
+            "CANDIDATE_SAVED"
+                | "DECISION_RECORDED"
+                | "SUSPENDED"
+                | "REMOVED"
+                | "PENDING_RECORDED"
         )
     {
         return Err(PeerWireError::InvalidField);
     }
     Ok(receipt)
-}
-
-fn hex_digest(bytes: &[u8; 32]) -> String {
-    bytes.iter().map(|b| format!("{b:02x}")).collect()
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -164,6 +166,13 @@ struct RawHello {
     manifest: Box<RawValue>,
 }
 
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct RawPending {
+    manifest: Box<RawValue>,
+    effective_at: String,
+}
+
 pub fn parse_peer_message(
     bytes: &[u8],
     authenticated_sender: &PlatformId,
@@ -178,7 +187,7 @@ pub fn parse_peer_message(
         return Err(PeerWireError::WrongService);
     }
     let raw: RawMessage = serde_json::from_slice(bytes).map_err(|_| PeerWireError::InvalidJson)?;
-    if raw.schema != "federation-peer/v1" {
+    if raw.schema != PEER_SCHEMA {
         return Err(PeerWireError::InvalidSchema);
     }
     if &raw.sender_platform_id != authenticated_sender
@@ -194,7 +203,7 @@ pub fn parse_peer_message(
     {
         return Err(PeerWireError::InvalidField);
     }
-    utc_timestamp(&raw.sent_at).map_err(|_| PeerWireError::InvalidField)?;
+    parse_utc(&raw.sent_at).ok_or(PeerWireError::InvalidField)?;
     let payload = match raw.kind {
         PeerKind::PeerHello => {
             let hello: RawHello =
@@ -207,34 +216,12 @@ pub fn parse_peer_message(
                 .map_err(|_| PeerWireError::WrongService)?;
             PeerPayload::Hello(snapshot)
         }
-        PeerKind::TrustRequest => {
-            let request: TrustRequestPayload =
-                serde_json::from_str(raw.payload.get()).map_err(|_| PeerWireError::InvalidJson)?;
-            digest(&request.sender_manifest_digest)?;
-            digest(&request.recipient_manifest_digest)?;
-            if request.request_id.as_str().is_empty()
-                || request.requested_capabilities.len() > 64
-                || request
-                    .requested_capabilities
-                    .iter()
-                    .any(|c| c.is_empty() || c.len() > 256)
-            {
-                return Err(PeerWireError::InvalidField);
-            }
-            let expiry =
-                utc_timestamp(&request.expires_at).map_err(|_| PeerWireError::InvalidField)?;
-            let sent = utc_timestamp(&raw.sent_at).map_err(|_| PeerWireError::InvalidField)?;
-            if expiry <= sent {
-                return Err(PeerWireError::InvalidField);
-            }
-            PeerPayload::Request(request)
-        }
         PeerKind::TrustDecision => {
             let decision: TrustDecisionPayload =
                 serde_json::from_str(raw.payload.get()).map_err(|_| PeerWireError::InvalidJson)?;
-            digest(&decision.sender_manifest_digest)?;
-            digest(&decision.recipient_manifest_digest)?;
-            utc_timestamp(&decision.decided_at).map_err(|_| PeerWireError::InvalidField)?;
+            decode_digest(&decision.sender_manifest_digest)?;
+            decode_digest(&decision.recipient_manifest_digest)?;
+            parse_utc(&decision.decided_at).ok_or(PeerWireError::InvalidField)?;
             if decision.request_id.as_str().is_empty()
                 || decision.approved_capabilities.len() > 64
                 || (decision.result == TrustDecisionResult::Rejected
@@ -256,12 +243,31 @@ pub fn parse_peer_message(
             validate_restriction(&restriction)?;
             PeerPayload::Remove(restriction)
         }
+        PeerKind::ManifestPending => {
+            let pending: RawPending =
+                serde_json::from_str(raw.payload.get()).map_err(|_| PeerWireError::InvalidJson)?;
+            let snapshot = parse_manifest(pending.manifest.get().as_bytes())
+                .map_err(|_| PeerWireError::InvalidManifest)?;
+            // The new revision may change service identities; only the
+            // platform must stay the same. Revalidation is the receiver's job.
+            if &snapshot.manifest.platform.platform_id != authenticated_sender {
+                return Err(PeerWireError::WrongPeer);
+            }
+            let effective = parse_utc(&pending.effective_at).ok_or(PeerWireError::InvalidField)?;
+            let sent = parse_utc(&raw.sent_at).ok_or(PeerWireError::InvalidField)?;
+            if effective <= sent {
+                return Err(PeerWireError::InvalidField);
+            }
+            PeerPayload::ManifestPending(PendingManifest {
+                manifest: snapshot,
+                effective_at: pending.effective_at,
+            })
+        }
     };
     let value: serde_json::Value =
         serde_json::from_slice(bytes).map_err(|_| PeerWireError::InvalidJson)?;
-    let canonical_bytes =
-        serde_json_canonicalizer::to_vec(&value).map_err(|_| PeerWireError::Canonicalization)?;
-    let body_digest = Sha256::digest(&canonical_bytes).into();
+    let (canonical_bytes, body_digest) =
+        canonical_digest(&value).ok_or(PeerWireError::Canonicalization)?;
     Ok(ParsedPeerMessage {
         message: PeerMessage {
             message_id: raw.message_id,
@@ -281,44 +287,54 @@ fn validate_restriction(value: &RestrictionPayload) -> Result<(), PeerWireError>
     if value.reason_code.is_empty() || value.reason_code.len() > 256 {
         return Err(PeerWireError::InvalidField);
     }
-    utc_timestamp(&value.effective_at).map_err(|_| PeerWireError::InvalidField)?;
+    parse_utc(&value.effective_at).ok_or(PeerWireError::InvalidField)?;
     Ok(())
 }
-fn digest(value: &str) -> Result<(), PeerWireError> {
-    if value.len() != 64
-        || !value
-            .bytes()
-            .all(|b| b.is_ascii_digit() || (b'a'..=b'f').contains(&b))
-    {
-        Err(PeerWireError::InvalidField)
-    } else {
-        Ok(())
-    }
-}
-
 pub fn decode_digest(value: &str) -> Result<[u8; 32], PeerWireError> {
-    digest(value)?;
-    let mut bytes = [0u8; 32];
-    for (index, pair) in value.as_bytes().chunks_exact(2).enumerate() {
-        let high = (pair[0] as char)
-            .to_digit(16)
-            .ok_or(PeerWireError::InvalidField)?;
-        let low = (pair[1] as char)
-            .to_digit(16)
-            .ok_or(PeerWireError::InvalidField)?;
-        bytes[index] = ((high << 4) | low) as u8;
-    }
-    Ok(bytes)
+    decode_hex32(value).ok_or(PeerWireError::InvalidField)
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+
     #[test]
-    fn trust_request_is_bounded_and_sender_bound() {
+    fn pending_manifest_names_the_same_platform_and_a_future_time() {
+        let a = PlatformId::new("provider-a").unwrap();
+        let b = PlatformId::new("provider-b").unwrap();
+        let control = "spiffe://provider-b.test/federation/control";
+        let mut next = crate::provider_manifest::tests::valid();
+        next.revision = 2;
+        next.workload_trust.control_service_identity = "spiffe://provider-b.test/federation/control-2".into();
+        let message = |manifest: &crate::provider_manifest::ProviderManifest, effective: &str| {
+            serde_json::to_vec(&serde_json::json!({"schema":PEER_SCHEMA,"message_id":"m9","kind":"MANIFEST_PENDING",
+                "sender_platform_id":"provider-b","recipient_platform_id":"provider-a","generation":3,
+                "sent_at":"2026-09-23T08:00:00Z","payload":{"manifest":manifest,"effective_at":effective}})).unwrap()
+        };
+        let parsed = parse_peer_message(&message(&next, "2026-09-30T08:00:00Z"), &b, &a, control, control).unwrap();
+        let PeerPayload::ManifestPending(pending) = parsed.message.payload else { panic!() };
+        assert_eq!(pending.manifest.manifest.revision, 2);
+        assert_eq!(
+            parse_peer_message(&message(&next, "2026-09-23T08:00:00Z"), &b, &a, control, control).err(),
+            Some(PeerWireError::InvalidField)
+        );
+        let mut other = next.clone();
+        other.platform.platform_id = PlatformId::new("provider-c").unwrap();
+        assert_eq!(
+            parse_peer_message(&message(&other, "2026-09-30T08:00:00Z"), &b, &a, control, control).err(),
+            Some(PeerWireError::WrongPeer)
+        );
+        let legacy = String::from_utf8(message(&next, "2026-09-30T08:00:00Z")).unwrap().replace(PEER_SCHEMA, "federation-peer/v1");
+        assert_eq!(
+            parse_peer_message(legacy.as_bytes(), &b, &a, control, control).err(),
+            Some(PeerWireError::InvalidSchema)
+        );
+    }
+    #[test]
+    fn trust_decision_is_bounded_and_sender_bound() {
         let zero = "00".repeat(32);
         let one = "11".repeat(32);
-        let json = serde_json::json!({"schema":"federation-peer/v1","message_id":"m1","kind":"TRUST_REQUEST","sender_platform_id":"provider-a","recipient_platform_id":"provider-b","generation":1,"sent_at":"2026-09-23T08:00:00Z","payload":{"request_id":"trust-1","sender_manifest_digest":zero,"recipient_manifest_digest":one,"requested_capabilities":["REQUEST_DELIVERY"],"expires_at":"2026-09-24T08:00:00Z"}});
+        let json = serde_json::json!({"schema":"federation-peer/v2","message_id":"m1","kind":"TRUST_DECISION","sender_platform_id":"provider-a","recipient_platform_id":"provider-b","generation":1,"sent_at":"2026-09-23T08:00:00Z","payload":{"request_id":"trust-1","result":"APPROVED","sender_manifest_digest":zero,"recipient_manifest_digest":one,"approved_capabilities":["REQUEST_DELIVERY"],"decided_at":"2026-09-23T08:00:00Z"}});
         let bytes = serde_json::to_vec(&json).unwrap();
         let a = PlatformId::new("provider-a").unwrap();
         let b = PlatformId::new("provider-b").unwrap();
@@ -356,7 +372,7 @@ mod tests {
     fn peer_receipt_binds_exact_message_and_receiver() {
         let a = PlatformId::new("provider-a").unwrap();
         let b = PlatformId::new("provider-b").unwrap();
-        let request = serde_json::json!({"schema":"federation-peer/v1","message_id":"m1","kind":"TRUST_REMOVE","sender_platform_id":"provider-a","recipient_platform_id":"provider-b","generation":2,"sent_at":"2026-09-23T08:00:00Z","payload":{"reason_code":"OPERATOR_REMOVED","effective_at":"2026-09-23T08:00:00Z"}});
+        let request = serde_json::json!({"schema":"federation-peer/v2","message_id":"m1","kind":"TRUST_REMOVE","sender_platform_id":"provider-a","recipient_platform_id":"provider-b","generation":2,"sent_at":"2026-09-23T08:00:00Z","payload":{"reason_code":"OPERATOR_REMOVED","effective_at":"2026-09-23T08:00:00Z"}});
         let sent = parse_peer_message(
             &serde_json::to_vec(&request).unwrap(),
             &a,
@@ -365,7 +381,7 @@ mod tests {
             "spiffe://provider-a.test/control",
         )
         .unwrap();
-        let mut receipt = serde_json::json!({"schema":"federation-peer-receipt/v1","sender_platform_id":"provider-b","recipient_platform_id":"provider-a","generation":2,"message_id":"m1","body_digest":hex_digest(&sent.body_digest),"result":"REMOVED"});
+        let mut receipt = serde_json::json!({"schema":"federation-peer-receipt/v1","sender_platform_id":"provider-b","recipient_platform_id":"provider-a","generation":2,"message_id":"m1","body_digest":hex_lower(&sent.body_digest),"result":"REMOVED"});
         assert!(parse_peer_receipt(&serde_json::to_vec(&receipt).unwrap(), &sent, &b).is_ok());
         receipt["body_digest"] = serde_json::json!("00".repeat(32));
         assert_eq!(

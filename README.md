@@ -1,150 +1,127 @@
-# PTPAN Base
+# PTPAN
 
-PTPAN Base (Private-to-Private Agent Network) is the connection between two independently operated agent platforms. Each platform keeps its own accounts, agents, grants, keys, and task runtime. Base does not merge those interiors. It gives both platforms the same rules for trusting each other and for carrying one private request from a user on one platform to an agent that lives on the other.
+PTPAN (Private-to-Private Agent Network) connects two independently operated agent platforms. Each platform keeps its own accounts, agents, storage, identifiers and task runtime. PTPAN gives both the same rules for trusting each other and for carrying one private request, and later the agent's traffic, from a user on one platform to an agent on the other.
 
-A platform can keep serving its own users with no peer connected. Base is involved when a user asks to reach an agent on a different platform.
+A platform serves its own users with no peer connected. PTPAN is involved only when a user asks to reach an agent on another platform. Both platforms run the same package; "source" and "destination" are roles in one request.
 
-Both platforms run this same package. "Source" and "destination" are roles in one request, not two different products.
+## What a platform keeps, and what it shares
 
-## What stays inside a platform
+A platform's internals stay its own: storage, internal IDs, address format, certificate issuing and language. Platforms share only what crosses a boundary:
 
-The platform's own host adapter is the authority for:
+- the wire messages (`schemas/`),
+- the address envelope,
+- the agent certificate rule,
+- the adapter–platform API (`proto/ptpan/platform/v1/platform.proto`),
+- the behaviours the API implies (inbox for the owning account only, atomic decisions, local cutoff before propagation, and so on).
 
-- accounts and login
-- which account owns which agent
-- the private index from a short handle to that agent
-- the enforceable grant
-- the agent's admission signing key
-- task execution
-
-PTPAN Base supplies the policy types and the required outcomes. It does not ship a shared account database or a production SQL schema. Two platforms never query each other's account tables.
+Account lists, agent inventories, internal IDs, grants, keys and task bodies never cross.
 
 ## What you install
 
-Install Rust (edition 2021) and Go **1.27.1**. From this repository:
+Each provider runs its own copy of everything below. Two providers share nothing.
+
+| Piece | What it is |
+|---|---|
+| Your platform | Implements `PlatformService` from the proto file over its own tables. |
+| `ptpan-adapter` (Rust) | The adapter runtime: peers, the exchange with other platforms, the platform resolver, admission checks over Base. It serves `AdapterService` to your platform. |
+| `bridge-runtime` (Go) | Carries control messages and agent streams between providers over SPIFFE mutual TLS. It makes no trust decision. |
+| PostgreSQL | The adapter's exchange store (peers, outbox, inbox). It holds no account data. |
+| [SPIRE](https://github.com/spiffe/spire) 1.15.5 server and agent | Issues the bridge its control and edge identities and federates trust bundles with each peer. |
+
+AGNTCY [Directory](https://github.com/agntcy/dir) and [OASF](https://github.com/agntcy/oasf) are optional. A Directory record can be added as extra evidence; onboarding does not need one.
+
+Build with Rust 1.85 and Go 1.27.1:
 
 ```sh
-cargo build --locked --workspace
-cd bridge
-go build -mod=readonly -o bridge-runtime ./cmd/bridge-runtime
+cargo build --locked --release -p ptpan-adapter
+cd bridge && go build -mod=readonly -o bridge-runtime ./cmd/bridge-runtime
 ```
 
-`Cargo.lock`, `bridge/go.mod`, and `bridge/go.sum` are the locked dependencies. The Go module path is `federation-base/bridge`.
+`Cargo.lock`, `bridge/go.mod` and `bridge/go.sum` lock every dependency.
 
-That build produces libraries and one bridge process. It does not start a platform. Each provider also runs its **own** copies of the services below. Provider A and provider B do not share them.
+### Running it
 
-| Service | Pinned release | What it is for |
-|---|---|---|
-| [AGNTCY Directory](https://github.com/agntcy/dir) API server and reconciler | v1.7.1 | This provider's record store, signatures, naming, and selected sync |
-| [AGNTCY OASF](https://github.com/agntcy/oasf) server | 1.1.1, schema 1.1.0 | Validates this provider's public records |
-| [SPIRE](https://github.com/spiffe/spire) server and agent | 1.11.2 | Workload certificates and federated trust bundles |
-| OCI registry and Postgres | Directory's own backing services | Directory content and its database, local to this provider |
+The adapter, the bridge and the platform run as three different users in one dedicated group. They talk over local Unix sockets (mode 0660), and each side checks the other's exact user ID on every connection.
 
-Go modules called by the bridge:
+- Adapter: `ptpan-adapter run adapter.json`. The JSON config holds the platform ID, the provider domain, the adapter's control and edge SPIFFE IDs, the PostgreSQL URL, the socket paths and the user IDs of the platform and bridge, the path of this provider's manifest, the evidence profile and a worker ID. It accepts no unknown fields.
+- Bridge: `bridge-runtime --control-listen … --edge-listen … --control-service-id spiffe://<domain>/federation/control --edge-service-id spiffe://<domain>/federation/edge --bridge-socket … --runtime-socket … --runtime-uid … --egress-socket … --ingress-socket … --platform-uid …`, with `SPIFFE_ENDPOINT_SOCKET` pointing at the SPIRE agent. Register both SPIFFE IDs for the bridge's user.
+- Operator commands: `ptpan-adapter peer add|approve|approve-pending|suspend|resume|remove`, `ptpan-adapter manifest propose`, `ptpan-adapter status`.
 
-| Module | Version | Called for |
-|---|---|---|
-| `github.com/agntcy/dir/client` and `github.com/agntcy/dir/api` | v1.7.1 | Directory store, sign, routing, naming, and catalog clients |
-| `github.com/agntcy/oasf-sdk/pkg` | v1.1.0 | Record validation against the local OASF server |
-| `github.com/spiffe/go-spiffe/v2` | v2.8.1 | SPIRE Workload API, mutual TLS, exact SPIFFE ID checks |
+## Connecting two providers
 
-## How those frameworks are wired in
+Trust is between operators. It is not a directory of customers.
 
-The Rust crates do not speak Directory or SPIRE. The Go bridge does, and it does not make trust decisions.
+1. **Bootstrap.** Each operator configures the other provider locally: platform ID, provider domain, exact control and edge SPIFFE IDs and endpoints, and SPIRE bundle endpoint and profile. A remote message cannot replace this.
+2. **Manifest.** The first message is the peer's provider manifest (`federation-provider/2`). It carries the platform and operator details; the trust domain, bundle endpoint and the exact control and edge service IDs; the control and edge endpoints; the supported protocols; and the agent CA root. Directory details are optional. Display and operator names stay claims.
+3. **Domain proof.** The adapter fetches `https://<provider domain>/.well-known/ptpan-provider.json` (`ptpan-provider-domain/1`). The document is served with the provider's normal WebPKI certificate. It publishes only the platform ID, the control and edge SPIFFE IDs and the agent CA root, and every field must match the manifest and the bootstrap.
+4. **Two approvals.** Each operator approves the peer. Request delivery opens only when the peer is active, the identity check has passed, both approvals are recorded, and the authenticated service on the connection is the exact one expected. Either operator can suspend or remove the peer at any time. Removal is final for that record.
 
-```text
-platform host  -->  federation-base (policy)
-       |                 ^
-       |                 | private Unix socket, already-authenticated SPIFFE ID
-       v                 |
-account / grant    bridge-runtime
-store                   |
-                        +--> this provider's Directory (exact server SPIFFE ID)
-                        +--> this provider's OASF server
-                        +--> this provider's SPIRE agent
-                        +--> the other provider's control endpoint (exact peer SPIFFE ID)
-```
+**Manifest changes.** Every manifest change must be validated again.
 
-**Directory.** `bridge/upstream` builds the official Directory client interfaces on one gRPC connection. It does not use the upstream convenience constructor whose x509 mode accepts any SPIFFE ID. The connection requires the Directory server ID configured for this provider, for example `spiffe://provider-a.example/directory/server`. The client can push, pull, sign, verify, publish, unpublish, and resolve names. The running bridge uses it to fetch Directory's verification result for one record CID and hand that evidence to Base. Publishing a record is a separate operator action. Connecting to another provider does not publish this provider's agents.
-
-**OASF.** At startup the bridge opens the OASF validator and schema client against this provider's OASF URL. A record that fails that check is not provider evidence. OASF does not approve a peer or a relationship.
-
-**SPIRE.** The bridge reads `SPIFFE_ENDPOINT_SOCKET`. SPIRE issues the bridge's X.509 SVID and refreshes federated bundles. Peer control is mutual TLS to `https://<peer>/control`. Both sides authorize one exact service ID, `spiffe://<their-domain>/federation/control`, not "any service in that trust domain." SPIRE, not Base, administers bundle rotation.
-
-**The socket between Base and the bridge.** Schema `base-bridge-ipc/v1`. The operations are send control, receive control, and resolve name evidence. The socket file is private to the two local processes, and each side checks the other's user ID. The SPIFFE ID on an inbound call is the one the bridge took from the peer certificate. A platform ID written in JSON is not authentication.
-
-## Provider-to-provider trust
-
-Trust is between operators, about their control services. It is not a directory of customers.
-
-Before the first hello, each operator locally configures the other provider's platform ID, domain, exact control SPIFFE ID, control URL, Directory endpoint, and bundle endpoint. That local configuration is the bootstrap. A remote message cannot replace it.
-
-The first message the other provider sends is a provider manifest. It describes the provider, not its customers:
-
-- platform ID, display name, operator name, and website
-- its Directory endpoint, catalog URL, and the CIDs of the public records it is willing to name
-- trust domain, SPIRE bundle endpoint, bundle profile, and the exact control-service SPIFFE ID with role `CONTROL`
-- its control URL, the protocols `federation-peer/v1` and `federation-control/v1`, and lease profile `FRL/1`
-
-Display name and operator name remain claims. Base records each checked field separately. The peer is accepted only when all of the following match the local bootstrap:
-
-- the SPIFFE ID on the live connection
-- the service ID and `CONTROL` role in the manifest
-- the trust domain and the website host
-- the control URL, both control protocols, and `FRL/1`
-- the Directory endpoint, bundle endpoint, and bundle profile
-- Directory's own verification of the named record: domain, key ID, verification time, record name, and a CID listed on the manifest
-
-A certificate alone does not open trust. A Directory record alone does not open trust. An operator approval alone does not open trust.
-
-After the evidence matches, each operator still has to approve the peer it will accept. Request delivery stays closed until the peer is active, both approvals are recorded, the identity check passed, and the exact control service is the one on the connection. Either operator can suspend or remove the peer. A changed manifest drops approval until it is reviewed again.
-
-## What is shared, and what is not
-
-On first connection the two providers exchange the manifest above and Directory's verification result for the named public record. They do not exchange:
-
-- account lists or agent inventories
-- private short handles
-- grants, leases, or admission keys
-- task bodies or connector credentials
-- SPIRE private keys or Directory signing keys
-
-A later agent request adds one address and the requester's own identifiers. It still does not include the destination account.
+- **Planned change:** the provider sends the proposed revision and its effective time to every peer in advance (`ptpan-adapter manifest propose`). If the peer's operator approves it before that time (`peer approve-pending`), the switch causes no outage.
+- **Unapproved or unannounced change:** all traffic with that peer stops until the change is validated and approved again. Revoke, block, withdrawal and suspension still flow while traffic is stopped. Routine certificate renewal under the same identity is not a manifest change.
 
 ## From one agent to another
 
-A user on platform A already has B's short handle, for example `0123456789abcdef.provider-b.example`. The characters before the dot are an opaque label. They are not a DNS name and they are not an account ID. A does not look them up.
+**Addresses.** An address is `<opaque part>.<provider domain>`. PTPAN routes it by the longest trusted provider domain it ends in (case-insensitive, punycode form). The only other checks are for wire safety: at most 253 bytes, using letters, digits, hyphen and dot. The opaque part is carried byte for byte. Only the platform that issued it resolves it.
 
-A looks only at the suffix, `provider-b.example`. That suffix must be the verified domain of a provider A already trusts, and A's request gate to that provider must be open. If the suffix belongs to anyone else, A refuses to send. If it matches, A sends the whole string, unchanged, to B's control service.
+**The request.** A user on platform A asks to connect one of their agents to an address on B. The request carries:
 
-The request names A's platform, A's account, and A's agent. It names the permission and lifetime A is asking for. It does not name B's account or B's agent. B is the only platform that can know those.
+- A's platform ID,
+- the requesting agent's own address (the requester reference),
+- the user's name,
+- the requested permission and lifetime,
+- the target address.
 
-B checks that the suffix is B's own domain, then looks the label up in B's private index and joins it to the agent B owns right now. One current owner gets an inbox item. That is a request waiting for a decision, not access. If the label is unknown or retired, B returns `ADDRESS_NOT_RECOGNIZED` and creates no grant. A's requesting account sees a correction notice. No other account on A sees it, and the notice does not reveal who owns what on B.
+It names no internal account or agent ID on either side.
 
-B's owner may refuse, or approve a narrower permission and a shorter lifetime. B issues an FRL/1 lease in one of three modes: a fixed expiry, until revoked, or a single task. B installs the grant in B's own store. Both sides acknowledge the configuration. The relationship is usable only when the grant, the lease, the current owner, and those acknowledgements still agree. A status message cannot create that permission.
+**On B.** B's platform resolves the address. Only the current owning account gets an inbox item. An unknown, retired or blocked address is answered "not recognized", and nothing more is revealed.
 
-When A's agent actually calls, A signs a fresh one-time challenge with that agent's admission key. B checks the signature, the audience, the nonce, the lease, the grant, and the deadline. The allow covers that call. It is not a reusable credential and it is not the task body. Revocation, expiry, a withdrawn source, or a suspended peer stops later calls.
+**The decision.** B's owner may:
 
-The reverse direction is a second relationship. B asks for an A-domain handle, and A resolves it in A's own index. A grant from A to B does not authorize B to A.
+- approve, possibly with a narrower permission and a shorter lifetime,
+- deny,
+- block.
 
-## Layout of this repository
+An approval carries the owner's name and an FRL/1 lease: fixed expiry, until revoked, or single task. Denials and blocks carry no name. The relationship becomes Ready only after both sides acknowledge the applied configuration. A's acknowledgment also binds the requesting agent's Ed25519 admission key.
+
+**Each call.** A's agent opens a stream through its own bridge with a fresh admission token (a compact JWS, `typ ptpan-admission+jwt`). The token is signed by the agent's key and bound to B's edge identity, the relationship, the lease and a single-use nonce. B checks it, and B's platform decides with an atomic nonce and key-revision check. An allowed stream lasts at most 300 seconds. Revoke, expiry, block, withdrawal or peer suspension stops new calls and closes open streams.
+
+**Agent TLS.** The destination agent's certificate must chain to the destination platform's private CA root, as published in its manifest. It must name the exact address the caller used. No public CA is involved.
+
+The reverse direction is a separate relationship.
+
+## Repository layout
 
 | Path | What it is |
 |---|---|
-| `crates/federation-base` | Identity checks, peer gate, requests, FRL/1 leases, lifecycle, admission decision |
-| `crates/federation-store` | Ports a platform implements for peers, durable events, and the private short-address index |
-| `crates/federation-ipc` | The local socket protocol between the host and the bridge |
-| `bridge` | Directory, OASF, and SPIRE integration, and authenticated control delivery |
-| `schemas` | Control and admission JSON profiles used on the wire |
+| `crates/federation-base` | Base: every shared rule, implemented once (addresses, manifests, identity evidence, peer transitions, requests, leases, lifecycle, admission) |
+| `crates/federation-ipc` | Adapter ↔ bridge local socket protocol (`base-bridge-ipc/v2`) |
+| `crates/ptpan-platform-api` | Rust binding of the platform API, Unix-socket transport, stateless policy calls |
+| `crates/ptpan-adapter` | Adapter runtime and CLI |
+| `bridge` | Go bridge runtime |
+| `schemas`, `proto` | Wire schemas, vectors and the platform API |
+| `docs/framework` | Developer documentation; `raw/platform-wiring.md` lists everything a platform wires in |
+| `crates/ptpan-conformance` | Black-box conformance suite for any `PlatformService` implementation |
+| `reference-platform`, `crates/ptpan-test-support` | A small SQLite test platform implementing `PlatformService`, and test stand-ins |
+| `scripts/ladder`, `deploy/ladder` | Two-provider Docker ladder, created and removed per run |
+
+Tests: `cargo test --locked --workspace` and `cd bridge && go test ./...`. The PostgreSQL end-to-end tests are ignored by default and read a connection string from `PTPAN_TEST_PG`. The two-provider ladder is `scripts/ladder/run.sh` (Docker).
 
 ## Not in this package
 
-This profile does not publish private agents into a public catalog. It does not resolve short handles through DNS. Public `ans://` names, SLIM transport, and the AGNTCY Identity Service are not part of this connection; if one of those is enabled later, it has to be the upstream project, not a second copy written here. A Directory record, a SPIRE certificate, and an owner approval answer different questions, and all three are required before a request can be delivered.
+- PTPAN does not publish private agents in a public catalog and does not resolve addresses through DNS.
+- SLIM is not built. The bridge has a transport seam for it, and `--agent-transport slim` refuses to start; the SLIM implementation is deferred.
+- Public `ans://` names and the AGNTCY Identity Service are not part of this connection. If they are enabled later, they must be the upstream projects, not a second copy written here.
 
 ## Agent capabilities
 
-Agent behavior and capabilities are the responsibility of the agent owner and its framework. Cross-platform identity, authorization, admission, and connection security are the responsibility of the participating platforms.
+The agent's behaviour and capabilities are the responsibility of its owner and its framework. Cross-platform identity, authorization, admission and connection security are the responsibility of the participating platforms.
 
-That split is the current route. Later, a platform may require an external agent to satisfy an accepted security profile before it allows a connection outside the owner's own account. PTPAN Base verifies and enforces that requirement. It does not define the agent sandbox, prompt-injection defenses, tool permissions, secret storage, or runtime isolation.
+A platform may later require an external agent to meet an accepted security profile before it allows a connection. PTPAN verifies and enforces that requirement. PTPAN does not define:
 
-The security framework and its governance remain outside PTPAN Base. Platforms may require conformance with an accepted framework as a condition of cross-platform access. PTPAN Base secures the road between agents. The owner and the agent's own framework decide how the agent is built.
+- the agent sandbox,
+- prompt-injection defences,
+- tool permissions,
+- secret storage,
+- runtime isolation.

@@ -1,0 +1,237 @@
+{
+  "profile": "ptpan-adapter",
+  "selected_at_utc": "2026-09-23T08:23:44Z",
+  "release_status": "INTEGRATION_INCOMPLETE",
+  "directory": {
+    "repository": "https://github.com/agntcy/dir",
+    "release": "v1.7.1",
+    "server_image": "ghcr.io/agntcy/dir-apiserver@sha256:631b489e0ddd01877ad4e4a38931fef7c88e7861f1e2bc6da6047e6ee703e468",
+    "server_image_revision_label": "7bf5795ce7f6b2c3069ba2da1a32768701412334",
+    "go_client_module": "github.com/agntcy/dir/client@v1.7.1",
+    "go_api_module": "github.com/agntcy/dir/api@v1.7.1",
+    "authentication": "SPIRE X.509 on server; bridge creates exported official Client interfaces on a go-spiffe exact-ID gRPC connection because upstream client.New x509 uses AuthorizeAny",
+    "privacy": "A/B Directory services, OCI registries, OASF servers and Postgres stores occupy separate Docker networks; no cross-provider catalog peering or account publication enabled",
+    "executed": [
+      "A and B OASF validation",
+      "A and B authenticated AI Finder GetWellKnownCatalog",
+      "A and B official client Push and Pull",
+      "A and B Cosign-library key generation with separate test key volumes",
+      "A and B official Directory Sign and Verify",
+      "A and B Publish, bounded local routing List, and Unpublish",
+      "A to B and B to A selected one-CID direct registry sync using official CreateSync plus upstream reconciler",
+      "A and B cross-provider Pull and Verify of selected synthetic public records",
+      "A and B naming.v1 domain-key verification through local test HTTP JWKS",
+      "wrong domain publisher key rejected by naming.v1",
+      "wrong Directory SPIFFE ID rejected",
+      "invalid OASF record rejected"
+    ],
+    "open": [
+      "controlled routing peering/discovery profile",
+      "production HTTPS publisher domain proof and field-level provider binding",
+      "CSIT"
+    ]
+  },
+  "reconciler": {
+    "repository": "https://github.com/agntcy/dir",
+    "release": "v1.7.1",
+    "image": "ghcr.io/agntcy/dir-reconciler@sha256:998d1f8a9344878a57833a8e08c7cd4ff844e431e76cf7c7d5dbb7ebebe5326a",
+    "image_revision_label": "7bf5795ce7f6b2c3069ba2da1a32768701412334",
+    "selected_tasks": [
+      "regsync",
+      "indexer",
+      "signature",
+      "name"
+    ],
+    "test_only_disabled_tasks": [
+      "scan",
+      "metrics"
+    ],
+    "observed": "A and B exact-CID sync completed with regsync; local HTTP test JWKS enabled naming.v1 domain-key checks. HTTP and unprotected test registries are not a VPS security profile."
+  },
+  "oasf": {
+    "repository": "https://github.com/agntcy/oasf",
+    "server_image": "ghcr.io/agntcy/oasf-server@sha256:0b8965ebfeadc4c80943d16aa64581b8ccbf716630119c6ef301e45bc14c14df",
+    "server_image_revision_label": "c81d794a29483067266e7b369c39c500b6a9b85b",
+    "server_version": "1.1.1",
+    "schema_version": "1.1.0",
+    "go_sdk_module": "github.com/agntcy/oasf-sdk/pkg@v1.1.0",
+    "observed_issue": "Directory v1.7.1 attempts to publish a bundled 1.0.0 skill record that OASF 1.1.0 rejects; service remains running. The selected 1.1.0 test record validates and Push/Pull succeeds."
+  },
+  "registry": "ghcr.io/project-zot/zot@sha256:6b69512c00dceaad05b1144e6079aac6aa7309d7fd200f9947ecb1de09cf48c8",
+  "postgres": "docker.io/bitnami/postgresql@sha256:7d77a46bbf200709237318c27dec0eaeae2520e403dd18fdebde2be7a6b04993",
+  "spire": {
+    "version": "1.15.5",
+    "server": "ghcr.io/spiffe/spire-server:1.15.5@sha256:584a9c5cc95b9457f5033e7e4488d603fffe5ec48a80c4dba14b05c5e1c2c384",
+    "agent": "ghcr.io/spiffe/spire-agent:1.15.5@sha256:3652c732b0f0d36f4dd78394230a1b1cd0ddcc29548a46c67a996b1a78c14481",
+    "go_spiffe_module": "github.com/spiffe/go-spiffe/v2@v2.9.0",
+    "selected_federation_profile": "https_spiffe",
+    "observed": "per-run ladder (scripts/ladder/run.sh rows 01-04): two trust domains, https_spiffe bundle exchange, exact control and edge SVIDs, wrong-service rejection"
+  },
+  "csit": {
+    "repository": "https://github.com/agntcy/csit",
+    "inspected_commit": "b95e675669500fecf26ea4328cbfe99a0d62943e",
+    "inspected_path": "integrations/agntcy-dir/tests/conformance/Taskfile.yml",
+    "selected_directory": "v1.7.1",
+    "advertised_server_versions": [
+      "v1.2.0",
+      "v1.3.0"
+    ],
+    "advertised_client_versions": [
+      "v1.3.0"
+    ],
+    "status": "NO_APPLICABLE_SELECTED_VERSION_SUITE",
+    "observed": "The pinned CSIT Directory conformance Taskfile has no v1.7.1 server or client suite. The separate v1.7.1 A/B Directory/OASF probes remain required and were run; no CSIT pass is claimed."
+  },
+  "admission_jose": {
+    "checked_at_utc": "2026-10-21T18:40:00Z",
+    "basis": "decisions D4 and adapter_build A0",
+    "rfc9864": "RFC 9864 (October 2025) registers the fully-specified JOSE alg Ed25519 and deprecates the polymorphic EdDSA registration; deprecated is not prohibited.",
+    "slim": {
+      "repository": "https://github.com/agntcy/slim",
+      "inspected_commit": "aa932ea",
+      "observed": "crates/auth uses jsonwebtoken 10.3.0 with ed25519-dalek 2.1; Ed25519 keys sign and verify with alg EdDSA (Algorithm::EdDSA). The fully-specified Ed25519 identifier is not used."
+    },
+    "agntcy_identity": {
+      "repositories": [
+        "https://github.com/agntcy/identity",
+        "https://github.com/agntcy/identity-service"
+      ],
+      "inspected_commits": {
+        "identity": "8f7c1b5",
+        "identity-service": "b31e92a"
+      },
+      "observed": "pkg/joseutil determineAlgorithm accepts only RS256, RS384 and RS512 (lestrrat-go/jwx v3.3.0). No Ed25519 or EdDSA signing path."
+    },
+    "selected_profile": {
+      "emit": "Ed25519",
+      "accept": [
+        "Ed25519",
+        "EdDSA (only with an Ed25519 key; Ed448 refused)"
+      ],
+      "typ": "ptpan-admission+jwt",
+      "kid": "did:key (multicodec ed25519-pub 0xed01, multibase base58btc)",
+      "implementation": "Base verifies the narrow compact-JWS profile itself with ed25519-dalek; no general JWT library, so no algorithm negotiation surface"
+    }
+  },
+  "base_rust_crates": {
+    "basis": "adapter_build A2-A5; exact pins in Cargo.toml, checksums from Cargo.lock; toolchain rustc 1.85.0 with rust-version = 1.85 and resolver = 3",
+    "crates": [
+      {
+        "name": "ed25519-dalek",
+        "version": "2.2.0",
+        "checksum": "70e796c081cee67dc755e1a36a0a172b897fab85fc3f6bc48307991f64e4eca9",
+        "used_for": "admission JWS Ed25519 sign and verify_strict (D4); same major as SLIM's auth crate"
+      },
+      {
+        "name": "bs58",
+        "version": "0.5.1",
+        "checksum": "bf88ba1141d185c399bee5288d850d63b8369520c1eafc32a0430b5b6c287bf4",
+        "used_for": "did:key base58btc multibase (D4)"
+      },
+      {
+        "name": "base64",
+        "version": "0.22.1",
+        "checksum": "72b3254f16251a8381aa12e40e3c4d2f0199f8c6508fbecb9d91f575e0fbb8c6",
+        "used_for": "JWS base64url and agent CA root encoding (D4, D13)"
+      },
+      {
+        "name": "unicode-normalization",
+        "version": "0.1.26",
+        "checksum": "75cd3fb03d5288b3ba9a1ee103ac7e9cbb59f0b03d64f8ddfcc04dd42758a85d",
+        "used_for": "NFC check on human names (D6)"
+      },
+      {
+        "name": "tonic",
+        "version": "0.13.1",
+        "checksum": "7e581ba15a835f4d9ea06c55ab1bd4dce26fc53752c69a04aac00703bfb49ba9",
+        "used_for": "gRPC server and client for ptpan.platform.v1 (D2); 0.14 needs Rust 1.88"
+      },
+      {
+        "name": "prost",
+        "version": "0.13.5",
+        "checksum": "2796faa41db3ec313a31f7624d9286acf277b52de526150b7e69f3debf891ee5",
+        "used_for": "protobuf messages"
+      },
+      {
+        "name": "tonic-build",
+        "version": "0.13.1",
+        "checksum": "eac6f67be712d12f0b41328db3137e0d0757645d8904b4cb7d51cd9c2279e847",
+        "used_for": "code generation (build only)"
+      },
+      {
+        "name": "protox",
+        "version": "0.8.0",
+        "checksum": "424c2bd294b69c49b949f3619362bc3c5d28298cd1163b6d1a62df37c16461aa",
+        "used_for": "pure-Rust proto compiler, no protoc install (build only)"
+      },
+      {
+        "name": "tokio",
+        "version": "1.54.0",
+        "checksum": "a0c168a474b95bfecfe908a65d4bdffc523144b649a74c09c286afb35d53e0bc",
+        "used_for": "async runtime, Unix sockets, peer credentials"
+      },
+      {
+        "name": "tokio-stream",
+        "version": "0.1.19",
+        "checksum": "a3d06f0b082ba57c26b79407372e57cf2a1e28124f78e9479fe80322cf53420b",
+        "used_for": "Unix listener stream"
+      },
+      {
+        "name": "hyper-util",
+        "version": "0.1.21",
+        "checksum": "ddc03d96684f9226b8a787cdb71488417b53ab5ea8fdb1dac946cb9431cc8bff",
+        "used_for": "Unix-socket client connector"
+      },
+      {
+        "name": "tower",
+        "version": "0.5.3",
+        "checksum": "ebe5ef63511595f1344e2d5cfa636d973292adc0eec1f0ad45fae9f0851ab1d4",
+        "used_for": "connector service_fn"
+      },
+      {
+        "name": "tokio-postgres",
+        "version": "0.7.16",
+        "checksum": "dcea47c8f71744367793f16c2db1f11cb859d28f436bdb4ca9193eb1f787ee42",
+        "used_for": "adapter exchange store client (D1)"
+      },
+      {
+        "name": "deadpool-postgres",
+        "version": "0.14.2",
+        "checksum": "65a536565624b97fc19f758cd01b15d12908d3344425066efc8162236fbd3749",
+        "used_for": "connection pool shared by adapter loops"
+      },
+      {
+        "name": "postgres-protocol",
+        "version": "0.6.12",
+        "checksum": "08808e3c483c46e999108051c78334f473d5adb59d78bb80a1268c7e6aa6c514",
+        "used_for": "transitive; its sha2 0.11 held at 0.11.0 and ctutils at 0.4.2 by the Rust 1.85 MSRV-aware resolver (resolver = 3)"
+      }
+    ]
+  },
+  "adapter_store": {
+    "engine": "PostgreSQL 16",
+    "test_image": "postgres@sha256:721873c34ceb9f8d8fc265984940dc982404c105f19ad51be9fdc5970a6080ea",
+    "observed": "A5 end-to-end exchange test (crates/ptpan-adapter/tests/exchange.rs) passed against this image with a tmpfs data directory, removed after the run"
+  },
+  "bridge_go": {
+    "toolchain": "golang:1.27.1",
+    "go_spiffe": "v2.9.0",
+    "directory_client": "v1.7.1 (optional publication/evidence library only; bridge-runtime does not open it)",
+    "slim_bindings": "github.com/agntcy/slim-bindings-go/v3 v3.3.8 inspected (cgo + native library); not a dependency until review 16.8",
+    "observed": "A6: go build, vet and test passed in golang:1.27.1 with GOFLAGS=-mod=readonly"
+  },
+  "ladder": {
+    "basis": "adapter_build A8; per-run, removed on exit",
+    "command": "scripts/ladder/run.sh",
+    "compose": "deploy/ladder/compose.yaml",
+    "images": {
+      "spire_server": "ghcr.io/spiffe/spire-server:1.15.5@sha256:584a9c5cc95b9457f5033e7e4488d603fffe5ec48a80c4dba14b05c5e1c2c384",
+      "spire_agent": "ghcr.io/spiffe/spire-agent:1.15.5@sha256:3652c732b0f0d36f4dd78394230a1b1cd0ddcc29548a46c67a996b1a78c14481",
+      "postgres": "postgres:16-alpine@sha256:721873c34ceb9f8d8fc265984940dc982404c105f19ad51be9fdc5970a6080ea",
+      "runtime_base": "debian:trixie-slim@sha256:62bd423aeee912639ca8ee681c2b762cb3e25137e0a92b20be455898a9f034ad",
+      "well_known_server": "busybox:1.37@sha256:bdf57e528e45e4433820e045b29b4597825a1c9e38353532d90a01445013f82e",
+      "go_build": "golang:1.27.1@sha256:3680233e3204827fbdc66088528ae6d4b3d034f51d03a99d454f6de034888244"
+    },
+    "profile": "test only: SPIRE insecure_bootstrap, domain proof over plain HTTP (LOCAL_HTTP_TEST)"
+  }
+}

@@ -1,0 +1,229 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "live-admission/v3",
+  "title": "PTPAN live admission",
+  "description": "One admission per agent stream (D4, D11, D12). The frame opens the stream at the destination edge; the token is a compact JWS (header {alg: Ed25519 (EdDSA accepted only with an Ed25519 key), typ: ptpan-admission+jwt, kid: did:key}) signed by the requesting agent's admission key. No task body or credential is carried.",
+  "oneOf": [
+    {
+      "$ref": "#/$defs/frame"
+    },
+    {
+      "$ref": "#/$defs/response"
+    }
+  ],
+  "$defs": {
+    "frame": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "schema",
+        "token",
+        "destination_address",
+        "relationship_id"
+      ],
+      "properties": {
+        "schema": {
+          "const": "live-admission/v3"
+        },
+        "token": {
+          "type": "string",
+          "maxLength": 8192,
+          "pattern": "^[A-Za-z0-9_-]+\\.[A-Za-z0-9_-]+\\.[A-Za-z0-9_-]+$"
+        },
+        "destination_address": {
+          "type": "string",
+          "maxLength": 253,
+          "pattern": "^(?=[A-Za-z0-9.-]*\\.)[A-Za-z0-9-][A-Za-z0-9.-]{0,251}[A-Za-z0-9-]$"
+        },
+        "relationship_id": {
+          "type": "string",
+          "minLength": 1,
+          "maxLength": 256
+        }
+      }
+    },
+    "header": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "alg",
+        "typ",
+        "kid"
+      ],
+      "properties": {
+        "alg": {
+          "enum": [
+            "Ed25519",
+            "EdDSA"
+          ]
+        },
+        "typ": {
+          "const": "ptpan-admission+jwt"
+        },
+        "kid": {
+          "type": "string",
+          "pattern": "^did:key:z[1-9A-HJ-NP-Za-km-z]+$"
+        }
+      }
+    },
+    "claims": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "iss",
+        "sub",
+        "aud",
+        "iat",
+        "exp",
+        "jti",
+        "relationship_id",
+        "lease_id",
+        "lease_revision",
+        "operation",
+        "destination_address",
+        "key_revision"
+      ],
+      "properties": {
+        "iss": {
+          "type": "string",
+          "minLength": 1,
+          "maxLength": 256
+        },
+        "sub": {
+          "type": "string",
+          "maxLength": 253,
+          "pattern": "^(?=[A-Za-z0-9.-]*\\.)[A-Za-z0-9-][A-Za-z0-9.-]{0,251}[A-Za-z0-9-]$"
+        },
+        "aud": {
+          "type": "string",
+          "minLength": 1,
+          "maxLength": 256
+        },
+        "iat": {
+          "type": "integer",
+          "minimum": 1,
+          "maximum": 9007199254740991
+        },
+        "exp": {
+          "type": "integer",
+          "minimum": 1,
+          "maximum": 9007199254740991
+        },
+        "jti": {
+          "type": "string",
+          "minLength": 1,
+          "maxLength": 256
+        },
+        "relationship_id": {
+          "type": "string",
+          "minLength": 1,
+          "maxLength": 256
+        },
+        "lease_id": {
+          "type": "string",
+          "minLength": 1,
+          "maxLength": 256
+        },
+        "lease_revision": {
+          "type": "integer",
+          "minimum": 1,
+          "maximum": 9007199254740991
+        },
+        "operation": {
+          "type": "string",
+          "minLength": 1,
+          "maxLength": 256
+        },
+        "destination_address": {
+          "type": "string",
+          "maxLength": 253,
+          "pattern": "^(?=[A-Za-z0-9.-]*\\.)[A-Za-z0-9-][A-Za-z0-9.-]{0,251}[A-Za-z0-9-]$"
+        },
+        "key_revision": {
+          "type": "integer",
+          "minimum": 1,
+          "maximum": 9007199254740991
+        }
+      },
+      "description": "exp - iat is at most 60 seconds; sub is the requester reference."
+    },
+    "response": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "schema",
+        "result"
+      ],
+      "properties": {
+        "schema": {
+          "const": "live-admission/v3"
+        },
+        "result": {
+          "enum": [
+            "ALLOW",
+            "DENY"
+          ]
+        },
+        "deadline": {
+          "type": "integer",
+          "minimum": 1,
+          "maximum": 9007199254740991
+        },
+        "reason": {
+          "enum": [
+            "BAD_PROOF",
+            "WRONG_AUDIENCE",
+            "WRONG_ISSUER",
+            "PEER_NOT_ACTIVE",
+            "STALE_DEADLINE",
+            "KEY_REVISION_CHANGED",
+            "REUSED_NONCE",
+            "GRANT_DENIED",
+            "NOT_READY",
+            "SOURCE_WITHDRAWN"
+          ]
+        }
+      },
+      "allOf": [
+        {
+          "if": {
+            "properties": {
+              "result": {
+                "const": "ALLOW"
+              }
+            }
+          },
+          "then": {
+            "required": [
+              "deadline"
+            ],
+            "not": {
+              "required": [
+                "reason"
+              ]
+            }
+          }
+        },
+        {
+          "if": {
+            "properties": {
+              "result": {
+                "const": "DENY"
+              }
+            }
+          },
+          "then": {
+            "required": [
+              "reason"
+            ],
+            "not": {
+              "required": [
+                "deadline"
+              ]
+            }
+          }
+        }
+      ]
+    }
+  }
+}

@@ -5,20 +5,29 @@
 //! describe the Base-owned relationship and peer-policy rules.
 
 use serde::{Deserialize, Serialize};
-use sha2::{Digest, Sha256};
 use std::collections::BTreeSet;
 
+pub mod address;
 pub mod control_event;
+pub mod encoding;
 pub mod identity_evidence;
 pub mod peer_control;
 pub mod peer_routes;
 pub mod peer_transitions;
 pub mod provider_manifest;
-pub mod relationship_exchange;
 pub mod live_admission;
 pub mod relationship_lifecycle;
+pub mod time;
 
 const MAX_JCS_INTEGER: u64 = 9_007_199_254_740_991;
+
+/// Protocol versions this Base implements, as listed in a manifest (D2).
+pub const SUPPORTED_PROTOCOLS: [&str; 4] = [
+    "federation-peer/v2",
+    "federation-control/v3",
+    "live-admission/v3",
+    "FRL/1",
+];
 
 #[derive(Clone, Debug, Eq, PartialEq, Ord, PartialOrd, Hash, Serialize, Deserialize)]
 pub struct PlatformId(String);
@@ -29,7 +38,6 @@ pub struct OpaqueId(String);
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub enum ModelError {
     EmptyId,
-    SameProvider,
     EmptyPermissions,
     InvalidTime,
     InvalidLeaseMode,
@@ -38,19 +46,27 @@ pub enum ModelError {
     WrongRequest,
     ScopeBroadened,
     LifetimeBroadened,
-    WrongDirection,
     LeaseRevisionNotAdvanced,
     PeerNotApproved,
     WrongAuthenticatedPeer,
     RequestExpired,
-    InvalidLocalOwner,
     InvalidRevision,
     InvalidTermsDigest,
     Canonicalization,
     InvalidJson,
     InvalidTargetAddress,
+    InvalidRequesterReference,
+    InvalidName,
     MessageTooLarge,
 }
+
+impl std::fmt::Display for ModelError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "{self:?}")
+    }
+}
+
+impl std::error::Error for ModelError {}
 
 impl PlatformId {
     pub fn new(value: impl Into<String>) -> Result<Self, ModelError> {
@@ -80,47 +96,50 @@ impl OpaqueId {
     }
 }
 
+/// An agent as another platform sees it: its platform and an address
+/// (`<opaque part>.<provider domain>`) issued and resolved only by that
+/// platform (D5, D10). For the requester this is its requester reference.
+/// No internal account or agent ID crosses platforms.
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct Participant {
     pub platform_id: PlatformId,
-    pub subject_id: OpaqueId,
-    pub resource_id: OpaqueId,
+    pub address: String,
 }
 
+/// A human's name taken from their own platform's account record (D6). It is
+/// identity information for the other human, never routing or authority.
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
-pub struct Direction {
-    pub source_platform_id: PlatformId,
-    pub destination_platform_id: PlatformId,
+pub struct PersonName {
+    pub given_name: String,
+    pub family_name: String,
 }
 
-impl Direction {
-    pub fn new(source: PlatformId, destination: PlatformId) -> Result<Self, ModelError> {
-        if source == destination {
-            return Err(ModelError::SameProvider);
-        }
-        Ok(Self {
-            source_platform_id: source,
-            destination_platform_id: destination,
-        })
-    }
+/// Maximum bytes of one name part.
+pub const MAX_NAME_BYTES: usize = 128;
 
-    pub fn reverse(&self) -> Self {
-        Self {
-            source_platform_id: self.destination_platform_id.clone(),
-            destination_platform_id: self.source_platform_id.clone(),
+impl PersonName {
+    /// Plain text only: non-empty, at most `MAX_NAME_BYTES`, Unicode NFC, no
+    /// surrounding whitespace, and no control or bidirectional-formatting
+    /// characters.
+    pub fn validate(&self) -> Result<(), ModelError> {
+        fn part(value: &str) -> bool {
+            !value.is_empty()
+                && value.len() <= MAX_NAME_BYTES
+                && value.trim() == value
+                && unicode_normalization::is_nfc(value)
+                && !value.chars().any(|c| {
+                    c.is_control()
+                        || matches!(c, '\u{061C}' | '\u{200E}' | '\u{200F}' | '\u{202A}'..='\u{202E}' | '\u{2066}'..='\u{2069}')
+                })
+        }
+        if part(&self.given_name) && part(&self.family_name) {
+            Ok(())
+        } else {
+            Err(ModelError::InvalidName)
         }
     }
-}
-
-/// The source knows only the destination platform and a user-supplied exact
-/// agent address at request time. The destination host resolves its own owner.
-#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
-#[serde(deny_unknown_fields)]
-pub struct PendingTarget {
-    pub destination_platform_id: PlatformId,
-    pub full_agent_address: String,
 }
 
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
@@ -144,15 +163,20 @@ pub enum RequestKind {
 pub struct RelationshipRequest {
     pub relationship_id: OpaqueId,
     pub request_id: OpaqueId,
-    pub direction: Direction,
+    /// The requesting agent: the source platform and its requester reference.
     pub source: Participant,
     pub source_ownership_revision: u64,
+    pub requester_name: PersonName,
     pub request_kind: RequestKind,
     pub request_revision: u64,
     pub base_lease_revision: Option<u64>,
     pub application_protocol: String,
     pub transport: String,
-    pub target: PendingTarget,
+    /// The address the requester entered, carried byte for byte. The request
+    /// names no destination platform: the source platform never needs to
+    /// know other platforms (principle 3); the adapter routes by domain and
+    /// names the destination in the event envelope.
+    pub target_address: String,
     pub requested_permissions: BTreeSet<String>,
     pub requested_lifetime: LifetimeRequest,
     pub created_at: u64,
@@ -161,32 +185,22 @@ pub struct RelationshipRequest {
 
 impl RelationshipRequest {
     pub fn validate(&self) -> Result<(), ModelError> {
-        if self.direction.source_platform_id == self.direction.destination_platform_id {
-            return Err(ModelError::SameProvider);
-        }
         for value in [
             self.relationship_id.as_str(),
             self.request_id.as_str(),
             self.source.platform_id.as_str(),
-            self.source.subject_id.as_str(),
-            self.source.resource_id.as_str(),
-            self.target.destination_platform_id.as_str(),
         ] {
             if value.trim().is_empty() {
                 return Err(ModelError::EmptyId);
             }
         }
-        if self.source.platform_id != self.direction.source_platform_id
-            || self.target.destination_platform_id != self.direction.destination_platform_id
-        {
-            return Err(ModelError::WrongDirection);
+        if !address::valid_address(&self.source.address) {
+            return Err(ModelError::InvalidRequesterReference);
         }
-        if self.target.full_agent_address.trim().is_empty() {
-            return Err(ModelError::EmptyId);
-        }
-        if !identity_evidence::valid_private_short_address(&self.target.full_agent_address) {
+        if !address::valid_address(&self.target_address) {
             return Err(ModelError::InvalidTargetAddress);
         }
+        self.requester_name.validate()?;
         if self.application_protocol.trim().is_empty() || self.transport.trim().is_empty() {
             return Err(ModelError::EmptyId);
         }
@@ -234,12 +248,21 @@ impl RelationshipRequest {
     /// Digest of only the source's immutable requested terms. The destination
     /// owner is intentionally absent until its own host resolves the address.
     pub fn request_terms_digest(&self) -> Result<[u8; 32], ModelError> {
-        Ok(Sha256::digest(self.canonical_requested_terms()?).into())
+        Ok(encoding::sha256(&self.canonical_requested_terms()?))
     }
 
     pub fn canonical_requested_terms(&self) -> Result<Vec<u8>, ModelError> {
         self.validate()?;
         canonical_bytes(self)
+    }
+
+    /// The destination agent as the source names it: the issuing platform
+    /// and the address its user entered, unchanged.
+    pub fn destination(&self, destination_platform: &PlatformId) -> Participant {
+        Participant {
+            platform_id: destination_platform.clone(),
+            address: self.target_address.clone(),
+        }
     }
 }
 
@@ -281,12 +304,50 @@ pub struct RelationshipLease {
     pub terms_digest: [u8; 32],
 }
 
+/// The destination owner's chosen terms; the input to `ComputeLease` (D1).
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct OwnerTerms {
+    pub lease_id: OpaqueId,
+    pub lease_revision: u64,
+    pub decision_id: OpaqueId,
+    pub mode: LeaseMode,
+    pub effective_from: u64,
+    pub expires_at: Option<u64>,
+    pub effective_permissions: BTreeSet<String>,
+}
+
 impl RelationshipLease {
-    pub fn validate_against(
-        &self,
+    /// `ComputeLease` (D1): build the FRL/1 lease from the owner's terms,
+    /// validate it against the request (narrower only) and compute its terms
+    /// digest. The platform stores the result and stays the authority.
+    pub fn issue(
         request: &RelationshipRequest,
-        destination: &Participant,
-    ) -> Result<(), ModelError> {
+        destination_platform: &PlatformId,
+        terms: OwnerTerms,
+        destination_ownership_revision: u64,
+        destination_owner_name: &PersonName,
+    ) -> Result<Self, ModelError> {
+        let max_tasks = (terms.mode == LeaseMode::SingleTask).then_some(1);
+        let mut lease = Self {
+            lease_id: terms.lease_id,
+            relationship_id: request.relationship_id.clone(),
+            lease_revision: terms.lease_revision,
+            mode: terms.mode,
+            effective_from: terms.effective_from,
+            expires_at: terms.expires_at,
+            max_tasks,
+            granted_by_platform_id: destination_platform.clone(),
+            decision_id: terms.decision_id,
+            request_id: request.request_id.clone(),
+            effective_permissions: terms.effective_permissions,
+            terms_digest: [0; 32],
+        };
+        lease.terms_digest =
+            lease.compute_terms_digest(request, destination_ownership_revision, destination_owner_name)?;
+        Ok(lease)
+    }
+
+    pub fn validate_against(&self, request: &RelationshipRequest) -> Result<(), ModelError> {
         request.validate()?;
         if self.relationship_id != request.relationship_id {
             return Err(ModelError::WrongRelationship);
@@ -294,9 +355,7 @@ impl RelationshipLease {
         if self.request_id != request.request_id {
             return Err(ModelError::WrongRequest);
         }
-        if self.granted_by_platform_id != request.direction.destination_platform_id
-            || destination.platform_id != request.direction.destination_platform_id
-        {
+        if self.granted_by_platform_id == request.source.platform_id {
             return Err(ModelError::WrongDestinationIssuer);
         }
         if self.effective_permissions.is_empty()
@@ -373,29 +432,30 @@ impl RelationshipLease {
         }
     }
 
-    /// The destination computes this from one resolved owner binding. It is
-    /// distinct from the request digest whenever effective terms differ.
+    /// The destination computes this after its owner decided. It binds both
+    /// addresses, both humans' names and the destination's ownership
+    /// revision, and differs from the request digest whenever terms differ.
     pub fn compute_terms_digest(
         &self,
         request: &RelationshipRequest,
-        destination: &Participant,
         destination_ownership_revision: u64,
+        destination_owner_name: &PersonName,
     ) -> Result<[u8; 32], ModelError> {
-        Ok(Sha256::digest(self.canonical_effective_terms(
+        Ok(encoding::sha256(&self.canonical_effective_terms(
             request,
-            destination,
             destination_ownership_revision,
-        )?)
-        .into())
+            destination_owner_name,
+        )?))
     }
 
     pub fn canonical_effective_terms(
         &self,
         request: &RelationshipRequest,
-        destination: &Participant,
         destination_ownership_revision: u64,
+        destination_owner_name: &PersonName,
     ) -> Result<Vec<u8>, ModelError> {
-        self.validate_against(request, destination)?;
+        self.validate_against(request)?;
+        destination_owner_name.validate()?;
         if destination_ownership_revision == 0 || destination_ownership_revision > MAX_JCS_INTEGER {
             return Err(ModelError::InvalidRevision);
         }
@@ -404,8 +464,10 @@ impl RelationshipLease {
             relationship_id: &'a OpaqueId,
             source: &'a Participant,
             source_ownership_revision: u64,
+            requester_name: &'a PersonName,
             destination: &'a Participant,
             destination_ownership_revision: u64,
+            destination_owner_name: &'a PersonName,
             lease_id: &'a OpaqueId,
             lease_revision: u64,
             mode: &'a LeaseMode,
@@ -423,8 +485,10 @@ impl RelationshipLease {
             relationship_id: &self.relationship_id,
             source: &request.source,
             source_ownership_revision: request.source_ownership_revision,
-            destination,
+            requester_name: &request.requester_name,
+            destination: &request.destination(&self.granted_by_platform_id),
             destination_ownership_revision,
+            destination_owner_name,
             lease_id: &self.lease_id,
             lease_revision: self.lease_revision,
             mode: &self.mode,
@@ -443,11 +507,15 @@ impl RelationshipLease {
     pub fn verify_terms_digest(
         &self,
         request: &RelationshipRequest,
-        destination: &Participant,
         destination_ownership_revision: u64,
+        destination_owner_name: &PersonName,
     ) -> Result<(), ModelError> {
         if self.terms_digest
-            != self.compute_terms_digest(request, destination, destination_ownership_revision)?
+            != self.compute_terms_digest(
+                request,
+                destination_ownership_revision,
+                destination_owner_name,
+            )?
         {
             return Err(ModelError::InvalidTermsDigest);
         }
@@ -483,7 +551,7 @@ impl RelationshipLease {
 }
 
 fn canonical_bytes(value: &impl Serialize) -> Result<Vec<u8>, ModelError> {
-    serde_json_canonicalizer::to_vec(value).map_err(|_| ModelError::Canonicalization)
+    encoding::canonical_json(value).ok_or(ModelError::Canonicalization)
 }
 
 pub fn check_next_lease_revision(
@@ -539,58 +607,27 @@ impl PeerRequestGate {
     }
 }
 
-/// The destination host alone returns this result after checking its own
-/// address authority and current account/resource ownership. It never came
-/// from Directory or from a source-supplied destination account ID.
-#[derive(Clone, Debug, Eq, PartialEq)]
-pub enum LocalAddressResolution {
-    Found {
-        destination: Participant,
-        ownership_revision: u64,
-    },
-    NotRecognized,
-}
-
-/// This result stays inside the receiving provider. The owner binding is used
-/// for its local Inbox and is never copied into the delivery receipt.
-#[derive(Clone, Debug, Eq, PartialEq)]
-pub enum LocalIngressResult {
-    PendingForOwner {
-        destination: Participant,
-        ownership_revision: u64,
-    },
-    AddressNotRecognized,
-}
-
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum RequestDeliveryResult {
     QueuedForLocalOwner,
     AddressNotRecognized,
 }
 
-impl LocalIngressResult {
-    pub fn delivery_result(&self) -> RequestDeliveryResult {
-        match self {
-            Self::PendingForOwner { .. } => RequestDeliveryResult::QueuedForLocalOwner,
-            Self::AddressNotRecognized => RequestDeliveryResult::AddressNotRecognized,
-        }
-    }
-}
-
-pub fn classify_inbound_request(
+/// Checks an inbound request before its address is handed to the destination
+/// platform's internal resolver. `peer_domain` is the authenticated peer's
+/// verified provider domain and `local_domain` this platform's own. The
+/// opaque part is never inspected here (principle 3, D10).
+pub fn check_inbound_request(
     request: &RelationshipRequest,
     authenticated_peer: &PlatformId,
-    local_platform: &PlatformId,
+    peer_domain: &str,
+    local_domain: &str,
     gate: &PeerRequestGate,
     now: u64,
-    resolution: LocalAddressResolution,
-) -> Result<LocalIngressResult, ModelError> {
+) -> Result<(), ModelError> {
     request.validate()?;
-    if &request.direction.source_platform_id != authenticated_peer {
+    if &request.source.platform_id != authenticated_peer {
         return Err(ModelError::WrongAuthenticatedPeer);
-    }
-    if &request.direction.destination_platform_id != local_platform {
-        return Err(ModelError::WrongDirection);
     }
     if !gate.permits_request_delivery() {
         return Err(ModelError::PeerNotApproved);
@@ -598,23 +635,81 @@ pub fn classify_inbound_request(
     if now >= request.request_expires_at {
         return Err(ModelError::RequestExpired);
     }
-    match resolution {
-        LocalAddressResolution::Found {
-            destination,
-            ownership_revision,
-        } if &destination.platform_id == local_platform && ownership_revision > 0 => {
-            Ok(LocalIngressResult::PendingForOwner {
-                destination,
-                ownership_revision,
-            })
+    if !address::address_in_domain(&request.source.address, peer_domain) {
+        return Err(ModelError::InvalidRequesterReference);
+    }
+    if !address::address_in_domain(&request.target_address, local_domain) {
+        return Err(ModelError::InvalidTargetAddress);
+    }
+    Ok(())
+}
+
+/// Test helper: every object in a serialized Rust value must carry all of
+/// the schema's required keys and only declared keys, recursively. This keeps
+/// the checked-in JSON Schemas in step with the Rust wire types.
+#[cfg(test)]
+pub(crate) mod schema_check {
+    use serde_json::Value;
+
+    fn resolve<'a>(root: &'a Value, node: &'a Value) -> &'a Value {
+        match node.get("$ref").and_then(Value::as_str) {
+            Some(path) => {
+                let mut current = root;
+                for part in path.trim_start_matches("#/").split('/') {
+                    current = &current[part];
+                }
+                resolve(root, current)
+            }
+            None => node,
         }
-        LocalAddressResolution::Found { .. } => Err(ModelError::InvalidLocalOwner),
-        LocalAddressResolution::NotRecognized => Ok(LocalIngressResult::AddressNotRecognized),
+    }
+
+    pub(crate) fn matches(root: &Value, node: &Value, value: &Value, path: &str) {
+        let node = resolve(root, node);
+        if let Some(branches) = node.get("oneOf").and_then(Value::as_array) {
+            if value.is_null() {
+                return;
+            }
+            let branch = branches
+                .iter()
+                .map(|b| resolve(root, b))
+                .find(|b| b.get("type").and_then(Value::as_str) != Some("null"))
+                .expect("non-null branch");
+            return matches(root, branch, value, path);
+        }
+        match value {
+            Value::Object(map) => {
+                let properties = node["properties"]
+                    .as_object()
+                    .unwrap_or_else(|| panic!("{path}: no properties"));
+                let required = node["required"]
+                    .as_array()
+                    .unwrap_or_else(|| panic!("{path}: no required"));
+                for key in required {
+                    assert!(map.contains_key(key.as_str().unwrap()), "{path}: missing {key}");
+                }
+                for key in map.keys() {
+                    assert!(properties.contains_key(key), "{path}: undeclared {key}");
+                }
+                assert_eq!(node["additionalProperties"], false, "{path}: open object");
+                for (key, child) in map {
+                    matches(root, &properties[key.as_str()], child, &format!("{path}.{key}"));
+                }
+            }
+            Value::Array(items) => {
+                if let Some(items_schema) = node.get("items") {
+                    for item in items {
+                        matches(root, items_schema, item, path);
+                    }
+                }
+            }
+            _ => {}
+        }
     }
 }
 
 #[cfg(test)]
-mod tests {
+pub(crate) mod tests {
     use super::*;
 
     fn id(value: &str) -> OpaqueId {
@@ -625,26 +720,29 @@ mod tests {
         PlatformId::new(value).unwrap()
     }
 
+    fn name(given: &str, family: &str) -> PersonName {
+        PersonName {
+            given_name: given.into(),
+            family_name: family.into(),
+        }
+    }
+
     fn request() -> RelationshipRequest {
         RelationshipRequest {
             relationship_id: id("relationship-a-b"),
             request_id: id("request-1"),
-            direction: Direction::new(platform("a"), platform("b")).unwrap(),
             source: Participant {
                 platform_id: platform("a"),
-                subject_id: id("a-account"),
-                resource_id: id("a-agent"),
+                address: "Requester.7.providera.example".into(),
             },
             source_ownership_revision: 1,
+            requester_name: name("Ada", "Lovelace"),
             request_kind: RequestKind::Establish,
             request_revision: 1,
             base_lease_revision: None,
             application_protocol: "a2a".into(),
             transport: "https".into(),
-            target: PendingTarget {
-                destination_platform_id: platform("b"),
-                full_agent_address: "0123456789abcdef.providerb.example".into(),
-            },
+            target_address: "0123456789abcdef.providerb.example".into(),
             requested_permissions: BTreeSet::from(["a2a.invoke".into()]),
             requested_lifetime: LifetimeRequest::Fixed { expires_at: 3000 },
             created_at: 1000,
@@ -652,12 +750,13 @@ mod tests {
         }
     }
 
-    fn destination() -> Participant {
-        Participant {
-            platform_id: platform("b"),
-            subject_id: id("b-account"),
-            resource_id: id("b-agent"),
-        }
+    /// The test request as wire JSON, for schema checks in other modules.
+    pub(crate) fn request_value() -> serde_json::Value {
+        serde_json::to_value(request()).unwrap()
+    }
+
+    fn owner() -> PersonName {
+        name("Grace", "Hopper")
     }
 
     fn lease() -> RelationshipLease {
@@ -678,62 +777,116 @@ mod tests {
     }
 
     #[test]
-    fn destination_can_narrow_but_not_broaden() {
+    fn issue_builds_a_validated_lease_with_its_digest() {
         let request = request();
-        let mut lease = lease();
-        assert_eq!(lease.validate_against(&request, &destination()), Ok(()));
-        lease.expires_at = Some(3001);
+        let terms = OwnerTerms {
+            lease_id: id("lease-b-1"),
+            lease_revision: 1,
+            decision_id: id("decision-b-1"),
+            mode: LeaseMode::SingleTask,
+            effective_from: 1100,
+            expires_at: Some(1160),
+            effective_permissions: BTreeSet::from(["a2a.invoke".into()]),
+        };
+        let lease = RelationshipLease::issue(&request, &platform("b"), terms.clone(), 1, &owner()).unwrap();
+        assert_eq!(lease.max_tasks, Some(1));
+        assert_eq!(lease.granted_by_platform_id, platform("b"));
+        assert_eq!(lease.verify_terms_digest(&request, 1, &owner()), Ok(()));
+        let mut broader = terms;
+        broader.effective_permissions.insert("account.read".into());
         assert_eq!(
-            lease.validate_against(&request, &destination()),
-            Err(ModelError::LifetimeBroadened)
-        );
-        lease.expires_at = Some(1160);
-        lease.effective_permissions.insert("account.read".into());
-        assert_eq!(
-            lease.validate_against(&request, &destination()),
+            RelationshipLease::issue(&request, &platform("b"), broader, 1, &owner()),
             Err(ModelError::ScopeBroadened)
         );
     }
 
     #[test]
-    fn canonical_request_and_effective_digests_bind_distinct_terms() {
+    fn destination_can_narrow_but_not_broaden() {
         let request = request();
         let mut lease = lease();
-        let request_digest = request.request_terms_digest().unwrap();
-        lease.terms_digest = lease
-            .compute_terms_digest(&request, &destination(), 1)
-            .unwrap();
-        assert_ne!(request_digest, lease.terms_digest);
+        assert_eq!(lease.validate_against(&request), Ok(()));
+        lease.expires_at = Some(3001);
         assert_eq!(
-            lease.verify_terms_digest(&request, &destination(), 1),
-            Ok(())
+            lease.validate_against(&request),
+            Err(ModelError::LifetimeBroadened)
         );
+        lease.expires_at = Some(1160);
+        lease.effective_permissions.insert("account.read".into());
         assert_eq!(
-            lease.verify_terms_digest(&request, &destination(), 2),
-            Err(ModelError::InvalidTermsDigest)
+            lease.validate_against(&request),
+            Err(ModelError::ScopeBroadened)
         );
-        let mut changed_request = request.clone();
-        changed_request.target.full_agent_address.push_str(".wrong");
-        assert_ne!(
-            request_digest,
-            changed_request.request_terms_digest().unwrap()
-        );
-        let mut changed_lease = lease.clone();
-        changed_lease
-            .effective_permissions
-            .insert("account.read".into());
-        assert!(changed_lease
-            .verify_terms_digest(&request, &destination(), 1)
-            .is_err());
     }
 
     #[test]
-    fn typed_request_parser_rejects_duplicate_unknown_and_oversized_input() {
+    fn canonical_request_and_effective_digests_bind_codes_and_names() {
+        let request = request();
+        let mut lease = lease();
+        let request_digest = request.request_terms_digest().unwrap();
+        lease.terms_digest = lease.compute_terms_digest(&request, 1, &owner()).unwrap();
+        assert_ne!(request_digest, lease.terms_digest);
+        assert_eq!(lease.verify_terms_digest(&request, 1, &owner()), Ok(()));
+        assert_eq!(
+            lease.verify_terms_digest(&request, 2, &owner()),
+            Err(ModelError::InvalidTermsDigest)
+        );
+        assert_eq!(
+            lease.verify_terms_digest(&request, 1, &name("Grace", "Murray")),
+            Err(ModelError::InvalidTermsDigest)
+        );
+        let mut changed = request.clone();
+        changed.target_address = "0123456789ABCDEF.providerb.example".into();
+        assert_ne!(request_digest, changed.request_terms_digest().unwrap());
+        let mut renamed = request.clone();
+        renamed.requester_name.family_name = "Byron".into();
+        assert_ne!(request_digest, renamed.request_terms_digest().unwrap());
+        let effective = String::from_utf8(
+            lease.canonical_effective_terms(&request, 1, &owner()).unwrap(),
+        )
+        .unwrap();
+        assert!(effective.contains("\"address\":\"0123456789abcdef.providerb.example\""));
+        assert!(effective.contains("\"destination_owner_name\""));
+        assert!(!effective.contains("subject_id") && !effective.contains("resource_id"));
+    }
+
+    #[test]
+    fn request_carries_addresses_and_names_but_no_internal_ids() {
         let raw = String::from_utf8(request().canonical_requested_terms().unwrap()).unwrap();
-        let parsed = parse_relationship_request_json(raw.as_bytes()).unwrap();
-        assert_eq!(parsed.request_id.as_str(), "request-1");
-        let long_address = raw.replace("0123456789abcdef.providerb.example", "calendar.someuser.providerb.example");
-        assert_eq!(parse_relationship_request_json(long_address.as_bytes()), Err(ModelError::InvalidTargetAddress));
+        assert!(raw.contains("\"address\":\"Requester.7.providera.example\""));
+        assert!(raw.contains("\"requester_name\":{\"family_name\":\"Lovelace\",\"given_name\":\"Ada\"}"));
+        assert!(!raw.contains("subject_id") && !raw.contains("resource_id"));
+        let legacy = raw.replace(
+            "\"address\":\"Requester.7.providera.example\"",
+            "\"address\":\"Requester.7.providera.example\",\"subject_id\":\"account\"",
+        );
+        assert_eq!(
+            parse_relationship_request_json(legacy.as_bytes()),
+            Err(ModelError::InvalidJson)
+        );
+    }
+
+    #[test]
+    fn typed_request_parser_rejects_bad_addresses_names_and_input() {
+        let raw = String::from_utf8(request().canonical_requested_terms().unwrap()).unwrap();
+        assert_eq!(
+            parse_relationship_request_json(raw.as_bytes()).unwrap(),
+            request()
+        );
+        let bad_target = raw.replace("0123456789abcdef.providerb.example", "Calendar_1.providerb.example");
+        assert_eq!(
+            parse_relationship_request_json(bad_target.as_bytes()),
+            Err(ModelError::InvalidTargetAddress)
+        );
+        let bad_source = raw.replace("Requester.7.providera.example", "account-7");
+        assert_eq!(
+            parse_relationship_request_json(bad_source.as_bytes()),
+            Err(ModelError::InvalidRequesterReference)
+        );
+        let bad_name = raw.replace("\"Ada\"", "\"Ada\\u202e\"");
+        assert_eq!(
+            parse_relationship_request_json(bad_name.as_bytes()),
+            Err(ModelError::InvalidName)
+        );
         let duplicate = raw.replacen(
             "\"request_id\":\"request-1\",",
             "\"request_id\":\"request-1\",\"request_id\":\"other\",",
@@ -752,11 +905,21 @@ mod tests {
             parse_relationship_request_json(&vec![b' '; 32 * 1024 + 1]),
             Err(ModelError::MessageTooLarge)
         );
-        let same_provider = raw.replace("\"destination_platform_id\":\"b\"", "\"destination_platform_id\":\"a\"");
-        assert_eq!(
-            parse_relationship_request_json(same_provider.as_bytes()),
-            Err(ModelError::SameProvider)
-        );
+    }
+
+    #[test]
+    fn names_are_plain_normalized_text() {
+        assert_eq!(name("José", "Núñez").validate(), Ok(()));
+        for bad in [
+            name("", "x"),
+            name(" Ada", "Lovelace"),
+            name("Ada", "Lovelace\n"),
+            name("Ada\u{200f}", "Lovelace"),
+            name("Jose\u{301}", "Nunez"),
+            name(&"a".repeat(MAX_NAME_BYTES + 1), "x"),
+        ] {
+            assert_eq!(bad.validate(), Err(ModelError::InvalidName), "{bad:?}");
+        }
     }
 
     #[test]
@@ -764,18 +927,9 @@ mod tests {
         let mut lease = lease();
         lease.granted_by_platform_id = platform("a");
         assert_eq!(
-            lease.validate_against(&request(), &destination()),
+            lease.validate_against(&request()),
             Err(ModelError::WrongDestinationIssuer)
         );
-    }
-
-    #[test]
-    fn reverse_relationship_is_independent() {
-        let request = request();
-        let reverse = request.direction.reverse();
-        assert_eq!(reverse.source_platform_id, platform("b"));
-        assert_eq!(reverse.destination_platform_id, platform("a"));
-        assert_ne!(reverse, request.direction);
     }
 
     #[test]
@@ -792,10 +946,10 @@ mod tests {
         let mut lease = lease();
         lease.mode = LeaseMode::SingleTask;
         lease.max_tasks = Some(1);
-        assert_eq!(lease.validate_against(&request, &destination()), Ok(()));
+        assert_eq!(lease.validate_against(&request), Ok(()));
         lease.max_tasks = None;
         assert_eq!(
-            lease.validate_against(&request, &destination()),
+            lease.validate_against(&request),
             Err(ModelError::InvalidLeaseMode)
         );
     }
@@ -804,17 +958,17 @@ mod tests {
     fn destination_may_choose_a_stricter_lifetime_mode() {
         let mut request = request();
         request.requested_lifetime = LifetimeRequest::UntilRevoked;
-        assert_eq!(lease().validate_against(&request, &destination()), Ok(()));
+        assert_eq!(lease().validate_against(&request), Ok(()));
         let mut one_task = lease();
         one_task.mode = LeaseMode::SingleTask;
         one_task.max_tasks = Some(1);
-        assert_eq!(one_task.validate_against(&request, &destination()), Ok(()));
+        assert_eq!(one_task.validate_against(&request), Ok(()));
 
         request.requested_lifetime = LifetimeRequest::Fixed { expires_at: 3000 };
-        assert_eq!(one_task.validate_against(&request, &destination()), Ok(()));
+        assert_eq!(one_task.validate_against(&request), Ok(()));
         request.requested_lifetime = LifetimeRequest::SingleTask { expires_at: 3000 };
         assert_eq!(
-            lease().validate_against(&request, &destination()),
+            lease().validate_against(&request),
             Err(ModelError::LifetimeBroadened)
         );
     }
@@ -824,7 +978,7 @@ mod tests {
         let mut expired_decision = lease();
         expired_decision.effective_from = request().request_expires_at;
         assert_eq!(
-            expired_decision.validate_against(&request(), &destination()),
+            expired_decision.validate_against(&request()),
             Err(ModelError::InvalidTime)
         );
     }
@@ -864,65 +1018,35 @@ mod tests {
     }
 
     #[test]
-    fn private_address_resolution_stays_local_and_unknown_has_no_owner() {
+    fn inbound_check_binds_addresses_to_verified_domains() {
         let request = request();
-        let gate = approved_gate();
-        let local = platform("b");
-        let peer = platform("a");
-        let found = classify_inbound_request(
-            &request,
-            &peer,
-            &local,
-            &gate,
-            1100,
-            LocalAddressResolution::Found {
-                destination: destination(),
-                ownership_revision: 3,
-            },
-        )
-        .unwrap();
-        assert_eq!(
-            found.delivery_result(),
-            RequestDeliveryResult::QueuedForLocalOwner
-        );
-        let unknown = classify_inbound_request(
-            &request,
-            &peer,
-            &local,
-            &gate,
-            1100,
-            LocalAddressResolution::NotRecognized,
-        )
-        .unwrap();
-        assert_eq!(
-            unknown.delivery_result(),
-            RequestDeliveryResult::AddressNotRecognized
-        );
-    }
-
-    #[test]
-    fn inbound_request_rejects_unapproved_or_wrong_peer_before_account_routing() {
-        let request = request();
-        let local = platform("b");
-        let found = LocalAddressResolution::Found {
-            destination: destination(),
-            ownership_revision: 3,
+        let a = platform("a");
+        let check = |peer: &PlatformId, peer_domain: &str, local_domain: &str, gate: &PeerRequestGate, now| {
+            check_inbound_request(&request, peer, peer_domain, local_domain, gate, now)
         };
+        let gate = approved_gate();
+        assert_eq!(check(&a, "providera.example", "providerb.example", &gate, 1100), Ok(()));
+        assert_eq!(check(&a, "PROVIDERA.example", "providerb.EXAMPLE", &gate, 1100), Ok(()));
         assert_eq!(
-            classify_inbound_request(
-                &request,
-                &platform("c"),
-                &local,
-                &approved_gate(),
-                1100,
-                found.clone()
-            ),
+            check(&platform("c"), "providera.example", "providerb.example", &gate, 1100),
             Err(ModelError::WrongAuthenticatedPeer)
         );
-        let mut gate = approved_gate();
-        gate.local_operator_approved = false;
         assert_eq!(
-            classify_inbound_request(&request, &platform("a"), &local, &gate, 1100, found),
+            check(&a, "providerc.example", "providerb.example", &gate, 1100),
+            Err(ModelError::InvalidRequesterReference)
+        );
+        assert_eq!(
+            check(&a, "providera.example", "providerc.example", &gate, 1100),
+            Err(ModelError::InvalidTargetAddress)
+        );
+        assert_eq!(
+            check(&a, "providera.example", "providerb.example", &gate, 1200),
+            Err(ModelError::RequestExpired)
+        );
+        let mut closed = approved_gate();
+        closed.peer_identity_verified = false;
+        assert_eq!(
+            check(&a, "providera.example", "providerb.example", &closed, 1100),
             Err(ModelError::PeerNotApproved)
         );
     }

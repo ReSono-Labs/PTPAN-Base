@@ -1,64 +1,302 @@
-//! Peer trust transitions. A provider adapter loads its own rows, calls these
-//! functions, and persists the returned effect. Account tables are not an input.
+//! Peer trust state machine (principles 10–11, D8, D14). The adapter keeps
+//! one `PeerRecord` per trusted peer platform in its peer store, applies these
+//! functions to it, and persists the result. Nothing here reads accounts.
+//!
+//! A peer is open for request delivery only when the operator has not
+//! suspended or removed it, the peer has not suspended us, the identity check
+//! passed for the manifest it currently uses, the local operator approved
+//! exactly that manifest, and the peer approved our current manifest.
 
+use crate::identity_evidence::BootstrapAuthority;
 use crate::peer_control::TrustDecisionResult;
 use crate::{PeerRequestGate, PeerState};
+use serde::{Deserialize, Serialize};
 use std::collections::BTreeSet;
+
+/// The only capability a provider approval grants (requests may enter; no
+/// account discovery).
+pub const REQUEST_DELIVERY: &str = "REQUEST_DELIVERY";
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum PeerRuleError {
     InvalidTransition,
     ManifestMismatch,
     ServiceMismatch,
-    PeerNotFound,
-    EvidenceMismatch,
-    DuplicateMessageConflict,
+    NotVerified,
+    Removed,
 }
 
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
-pub enum CandidatePlan {
-    Insert,
-    Unchanged,
-    AdvanceRevision,
-    ResetApprovals,
+/// The operator's own setting for the peer.
+#[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize, Deserialize)]
+pub enum OperatorState {
+    Enabled,
+    Suspended,
+    Removed,
 }
 
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
-pub struct CandidatePrior<'a> {
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+pub struct ReceivedManifest {
     pub revision: u64,
-    pub digest: &'a [u8],
-    pub service: &'a str,
-    pub removed: bool,
+    pub digest: [u8; 32],
+    pub exact_bytes: Vec<u8>,
 }
 
-pub fn plan_candidate(
-    prior: Option<CandidatePrior<'_>>,
-    revision: u64,
-    digest: &[u8],
-    service: &str,
-) -> Result<CandidatePlan, PeerRuleError> {
-    if revision == 0 || service.is_empty() {
-        return Err(PeerRuleError::InvalidTransition);
+/// A planned revision the peer announced (D8).
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+pub struct PendingRevision {
+    pub manifest: ReceivedManifest,
+    pub effective_at: u64,
+    pub locally_approved: bool,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+pub struct PeerRecord {
+    pub bootstrap: BootstrapAuthority,
+    /// Bumps whenever the operator replaces the bootstrap; messages from an
+    /// older generation are ignored.
+    pub generation: u64,
+    pub operator: OperatorState,
+    pub remote_suspended: bool,
+    pub current: Option<ReceivedManifest>,
+    /// Digest of `current` whose identity check passed, if any, and when
+    /// its domain proof was fetched (unix seconds).
+    pub verified_digest: Option<[u8; 32]>,
+    pub verified_at: Option<u64>,
+    pub local_approved_digest: Option<[u8; 32]>,
+    /// Digests of our own manifest that the peer approved.
+    pub remote_approved_digests: BTreeSet<[u8; 32]>,
+    pub pending: Option<PendingRevision>,
+}
+
+impl PeerRecord {
+    pub fn new(bootstrap: BootstrapAuthority) -> Self {
+        Self {
+            bootstrap,
+            generation: 1,
+            operator: OperatorState::Enabled,
+            remote_suspended: false,
+            current: None,
+            verified_digest: None,
+            verified_at: None,
+            local_approved_digest: None,
+            remote_approved_digests: BTreeSet::new(),
+            pending: None,
+        }
     }
-    let Some(prior) = prior else {
-        return Ok(CandidatePlan::Insert);
-    };
-    if prior.removed || revision < prior.revision {
-        return Err(PeerRuleError::InvalidTransition);
+
+    fn current_digest(&self) -> Option<[u8; 32]> {
+        self.current.as_ref().map(|m| m.digest)
     }
-    if revision == prior.revision && prior.digest != digest {
-        return Err(PeerRuleError::ManifestMismatch);
+
+    /// The request gate for one moment, given our own current manifest
+    /// digest and the service authenticated on the connection.
+    pub fn gate(&self, own_digest: &[u8; 32], authenticated_service: Option<&str>) -> PeerRequestGate {
+        let verified = self.current_digest().is_some() && self.verified_digest == self.current_digest();
+        let local = self.local_approved_digest.is_some() && self.local_approved_digest == self.current_digest();
+        let remote = self.remote_approved_digests.contains(own_digest);
+        let service = authenticated_service.is_none_or(|s| s == self.bootstrap.expected_control_service_id);
+        let state = match self.operator {
+            OperatorState::Removed => PeerState::Removed,
+            OperatorState::Suspended => PeerState::Suspended,
+            OperatorState::Enabled if self.remote_suspended => PeerState::Suspended,
+            OperatorState::Enabled if verified && local && remote => PeerState::Active,
+            OperatorState::Enabled => PeerState::Pending,
+        };
+        PeerRequestGate {
+            state,
+            local_operator_approved: local,
+            remote_operator_approval_confirmed: remote,
+            peer_identity_verified: verified,
+            exact_service_authenticated: service,
+        }
     }
-    if revision == prior.revision && prior.service != service {
+
+    /// Operator replaced the bootstrap: everything learned under the old one
+    /// is discarded and the generation advances.
+    pub fn replace_bootstrap(&mut self, bootstrap: BootstrapAuthority) -> Result<(), PeerRuleError> {
+        if self.operator == OperatorState::Removed {
+            return Err(PeerRuleError::Removed);
+        }
+        let generation = self.generation + 1;
+        let operator = self.operator;
+        *self = Self::new(bootstrap);
+        self.generation = generation;
+        self.operator = operator;
+        Ok(())
+    }
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum HelloOutcome {
+    /// Same manifest as before; nothing changed.
+    Unchanged,
+    /// A new manifest replaced the current one. It must pass the identity
+    /// check again. `approval_kept` is true only for an announced revision the
+    /// operator approved in advance (D8); otherwise traffic stops until the
+    /// operator approves again.
+    Replaced { approval_kept: bool },
+}
+
+/// The peer presented its manifest on a hello, authenticated as
+/// `authenticated_service`.
+pub fn receive_hello(
+    record: &mut PeerRecord,
+    manifest: ReceivedManifest,
+    authenticated_service: &str,
+) -> Result<HelloOutcome, PeerRuleError> {
+    if record.operator == OperatorState::Removed {
+        return Err(PeerRuleError::Removed);
+    }
+    if authenticated_service != record.bootstrap.expected_control_service_id {
         return Err(PeerRuleError::ServiceMismatch);
     }
-    if revision > prior.revision && (prior.digest != digest || prior.service != service) {
-        Ok(CandidatePlan::ResetApprovals)
-    } else if revision > prior.revision {
-        Ok(CandidatePlan::AdvanceRevision)
-    } else {
-        Ok(CandidatePlan::Unchanged)
+    if let Some(current) = &record.current {
+        if manifest.revision < current.revision {
+            return Err(PeerRuleError::InvalidTransition);
+        }
+        if manifest.revision == current.revision {
+            return if manifest.digest == current.digest && manifest.exact_bytes == current.exact_bytes {
+                Ok(HelloOutcome::Unchanged)
+            } else {
+                Err(PeerRuleError::ManifestMismatch)
+            };
+        }
     }
+    let announced = record.pending.take().filter(|pending| {
+        pending.locally_approved && pending.manifest.digest == manifest.digest
+    });
+    let approval_kept = announced.is_some();
+    record.local_approved_digest = approval_kept.then_some(manifest.digest);
+    record.verified_digest = None;
+    record.verified_at = None;
+    record.current = Some(manifest);
+    Ok(HelloOutcome::Replaced { approval_kept })
+}
+
+/// Record the identity check result for `digest` (identity_evidence),
+/// with the time its domain proof was fetched.
+pub fn record_identity(record: &mut PeerRecord, digest: [u8; 32], verified_at: Option<u64>) {
+    if record.current_digest() == Some(digest) {
+        record.verified_digest = verified_at.map(|_| digest);
+        record.verified_at = verified_at;
+    }
+}
+
+/// True when the identity check is missing or older than the bootstrap's
+/// freshness limit, so the adapter must fetch the domain proof again.
+pub fn identity_needs_refresh(record: &PeerRecord, now: u64) -> bool {
+    let limit = u64::try_from(record.bootstrap.max_evidence_age_seconds).unwrap_or(0);
+    match (record.verified_digest, record.verified_at) {
+        (Some(_), Some(at)) => now.saturating_sub(at) >= limit / 2,
+        _ => record.current.is_some(),
+    }
+}
+
+/// The local operator approves the peer's current, verified manifest.
+pub fn approve_locally(record: &mut PeerRecord) -> Result<[u8; 32], PeerRuleError> {
+    if record.operator == OperatorState::Removed {
+        return Err(PeerRuleError::Removed);
+    }
+    let digest = record.current_digest().ok_or(PeerRuleError::NotVerified)?;
+    if record.verified_digest != Some(digest) {
+        return Err(PeerRuleError::NotVerified);
+    }
+    record.local_approved_digest = Some(digest);
+    Ok(digest)
+}
+
+/// The peer's decision about our manifest. `sender_digest` is the peer's own
+/// manifest it was looking at; it must be its current or announced one.
+pub fn receive_trust_decision(
+    record: &mut PeerRecord,
+    sender_digest: [u8; 32],
+    our_digest: [u8; 32],
+    result: TrustDecisionResult,
+    capabilities: &BTreeSet<String>,
+) -> Result<(), PeerRuleError> {
+    let known = record.current_digest() == Some(sender_digest)
+        || record.pending.as_ref().is_some_and(|p| p.manifest.digest == sender_digest);
+    if !known {
+        return Err(PeerRuleError::ManifestMismatch);
+    }
+    match result {
+        TrustDecisionResult::Approved
+            if capabilities.len() == 1 && capabilities.contains(REQUEST_DELIVERY) =>
+        {
+            record.remote_approved_digests.insert(our_digest);
+            record.remote_suspended = false;
+            Ok(())
+        }
+        TrustDecisionResult::Rejected if capabilities.is_empty() => {
+            record.remote_approved_digests.remove(&our_digest);
+            Ok(())
+        }
+        _ => Err(PeerRuleError::InvalidTransition),
+    }
+}
+
+/// The peer announced a planned revision (D8). A newer announcement replaces
+/// an older one and needs its own approval.
+pub fn receive_pending(
+    record: &mut PeerRecord,
+    manifest: ReceivedManifest,
+    effective_at: u64,
+) -> Result<(), PeerRuleError> {
+    if record.operator == OperatorState::Removed {
+        return Err(PeerRuleError::Removed);
+    }
+    if record.current.as_ref().is_some_and(|c| manifest.revision <= c.revision) {
+        return Err(PeerRuleError::InvalidTransition);
+    }
+    if let Some(prior) = &record.pending {
+        if prior.manifest.revision == manifest.revision && prior.manifest.digest == manifest.digest {
+            return Ok(());
+        }
+        if manifest.revision < prior.manifest.revision {
+            return Err(PeerRuleError::InvalidTransition);
+        }
+    }
+    record.pending = Some(PendingRevision { manifest, effective_at, locally_approved: false });
+    Ok(())
+}
+
+/// The local operator approves the announced revision in advance.
+pub fn approve_pending(record: &mut PeerRecord) -> Result<[u8; 32], PeerRuleError> {
+    let pending = record.pending.as_mut().ok_or(PeerRuleError::InvalidTransition)?;
+    pending.locally_approved = true;
+    Ok(pending.manifest.digest)
+}
+
+/// Restrictive operator actions. They take effect at once and are sent to
+/// the peer; revoke, block, withdrawal and suspension still flow afterwards.
+pub fn suspend(record: &mut PeerRecord) -> Result<(), PeerRuleError> {
+    match record.operator {
+        OperatorState::Removed => Err(PeerRuleError::Removed),
+        _ => {
+            record.operator = OperatorState::Suspended;
+            Ok(())
+        }
+    }
+}
+
+pub fn resume(record: &mut PeerRecord) -> Result<(), PeerRuleError> {
+    match record.operator {
+        OperatorState::Suspended => {
+            record.operator = OperatorState::Enabled;
+            Ok(())
+        }
+        _ => Err(PeerRuleError::InvalidTransition),
+    }
+}
+
+pub fn remove(record: &mut PeerRecord) {
+    record.operator = OperatorState::Removed;
+    record.local_approved_digest = None;
+}
+
+/// The peer suspended or removed us.
+pub fn receive_restriction(record: &mut PeerRecord) {
+    record.remote_suspended = true;
 }
 
 pub fn stored_peer_state(value: &str) -> Option<PeerState> {
@@ -66,552 +304,159 @@ pub fn stored_peer_state(value: &str) -> Option<PeerState> {
         "pending" => Some(PeerState::Pending),
         "active" => Some(PeerState::Active),
         "suspended" => Some(PeerState::Suspended),
+        "removing" => Some(PeerState::Removing),
         "removed" => Some(PeerState::Removed),
         _ => None,
-    }
-}
-
-pub fn bootstrap_replaces(prior: Option<&[u8]>, next: &[u8]) -> bool {
-    prior != Some(next)
-}
-
-pub fn hello_sender_service(
-    sender_matches: bool,
-    authenticated_service: &str,
-    expected_service: &str,
-) -> Result<(), PeerRuleError> {
-    if sender_matches && authenticated_service == expected_service {
-        Ok(())
-    } else {
-        Err(PeerRuleError::ServiceMismatch)
-    }
-}
-
-pub fn hello_generation_is_current(stored: u64, message: u64) -> Result<(), PeerRuleError> {
-    if stored == message {
-        Ok(())
-    } else {
-        Err(PeerRuleError::InvalidTransition)
-    }
-}
-
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
-pub enum DigestSlot {
-    Insert,
-    Same,
-}
-
-pub fn same_digest_slot(prior: Option<&[u8]>, digest: &[u8]) -> Result<DigestSlot, PeerRuleError> {
-    match prior {
-        Some(prior) if prior != digest => Err(PeerRuleError::ManifestMismatch),
-        Some(_) => Ok(DigestSlot::Same),
-        None => Ok(DigestSlot::Insert),
-    }
-}
-
-pub fn authenticated_control_parties(
-    sender_matches: bool,
-    recipient_matches: bool,
-    authenticated_service: &str,
-    expected_service: &str,
-) -> Result<(), PeerRuleError> {
-    if sender_matches
-        && recipient_matches
-        && authenticated_service == expected_service
-        && !expected_service.is_empty()
-    {
-        Ok(())
-    } else {
-        Err(PeerRuleError::ServiceMismatch)
-    }
-}
-
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
-pub struct PriorInbox<'a> {
-    pub sender: &'a str,
-    pub body_digest: &'a [u8],
-    pub exact_bytes: &'a [u8],
-    pub generation: i64,
-    pub result: &'a str,
-}
-
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
-pub enum InboxReplay<'a> {
-    First,
-    Same(&'a str),
-}
-
-pub fn classify_peer_inbox<'a>(
-    prior: Option<PriorInbox<'a>>,
-    sender: &str,
-    body_digest: &[u8],
-    exact_bytes: &[u8],
-    generation: i64,
-) -> Result<InboxReplay<'a>, PeerRuleError> {
-    let Some(prior) = prior else {
-        return Ok(InboxReplay::First);
-    };
-    if prior.sender == sender
-        && prior.body_digest == body_digest
-        && prior.exact_bytes == exact_bytes
-        && prior.generation == generation
-    {
-        Ok(InboxReplay::Same(prior.result))
-    } else {
-        Err(PeerRuleError::DuplicateMessageConflict)
-    }
-}
-
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
-pub struct HelloPeer {
-    pub generation: i64,
-    pub removed: bool,
-}
-
-pub fn accept_hello_generation(
-    current: Option<HelloPeer>,
-    message_generation: i64,
-) -> Result<(), PeerRuleError> {
-    match current {
-        None if message_generation == 1 => Ok(()),
-        Some(peer) if peer.generation == message_generation && !peer.removed => Ok(()),
-        _ => Err(PeerRuleError::InvalidTransition),
-    }
-}
-
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
-pub struct StoredManifest<'a> {
-    pub digest: &'a [u8],
-    pub exact_bytes: &'a [u8],
-    pub service: &'a str,
-}
-
-pub fn exact_manifest_slot(
-    prior: Option<StoredManifest<'_>>,
-    digest: &[u8],
-    exact_bytes: &[u8],
-    service: &str,
-) -> Result<DigestSlot, PeerRuleError> {
-    match prior {
-        Some(prior)
-            if prior.digest != digest
-                || prior.exact_bytes != exact_bytes
-                || prior.service != service =>
-        {
-            Err(PeerRuleError::ManifestMismatch)
-        }
-        Some(_) => Ok(DigestSlot::Same),
-        None => Ok(DigestSlot::Insert),
-    }
-}
-
-pub fn accept_continuing_peer(
-    removed: bool,
-    stored_generation: i64,
-    message_generation: i64,
-    expected_service: &str,
-    authenticated_service: &str,
-) -> Result<(), PeerRuleError> {
-    if removed
-        || stored_generation != message_generation
-        || expected_service != authenticated_service
-    {
-        Err(PeerRuleError::InvalidTransition)
-    } else {
-        Ok(())
-    }
-}
-
-pub fn trust_request_matches(
-    peer_digest: &[u8; 32],
-    sender_digest: Option<[u8; 32]>,
-    own_digest: &[u8; 32],
-    recipient_digest: Option<[u8; 32]>,
-    capabilities: &BTreeSet<String>,
-    pending: bool,
-    still_valid: bool,
-) -> Result<(), PeerRuleError> {
-    let only_delivery = capabilities.len() == 1 && capabilities.contains("REQUEST_DELIVERY");
-    if sender_digest.as_ref() != Some(peer_digest)
-        || recipient_digest.as_ref() != Some(own_digest)
-        || !only_delivery
-        || !pending
-    {
-        return Err(PeerRuleError::ManifestMismatch);
-    }
-    if !still_valid {
-        return Err(PeerRuleError::InvalidTransition);
-    }
-    Ok(())
-}
-
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
-pub enum RemoteTrustWrite {
-    Approve,
-    Reject,
-}
-
-pub fn remote_trust_decision(
-    sender_digest: Option<[u8; 32]>,
-    peer_digest: &[u8; 32],
-    recipient_digest: Option<[u8; 32]>,
-    own_digest: &[u8; 32],
-    result: TrustDecisionResult,
-    capabilities: &BTreeSet<String>,
-) -> Result<RemoteTrustWrite, PeerRuleError> {
-    if sender_digest.as_ref() != Some(peer_digest) || recipient_digest.as_ref() != Some(own_digest)
-    {
-        return Err(PeerRuleError::ManifestMismatch);
-    }
-    match result {
-        TrustDecisionResult::Approved
-            if capabilities.len() == 1 && capabilities.contains("REQUEST_DELIVERY") =>
-        {
-            Ok(RemoteTrustWrite::Approve)
-        }
-        TrustDecisionResult::Rejected if capabilities.is_empty() => Ok(RemoteTrustWrite::Reject),
-        _ => Err(PeerRuleError::InvalidTransition),
-    }
-}
-
-pub fn next_pending_state(
-    local_approved: bool,
-    remote_confirmed: bool,
-    identity_verified: bool,
-    exact_service_authenticated: bool,
-) -> PeerState {
-    if local_approved && remote_confirmed && identity_verified && exact_service_authenticated {
-        PeerState::Active
-    } else {
-        PeerState::Pending
-    }
-}
-
-pub fn apply_evidence_freshness(mut gate: PeerRequestGate, fresh: bool) -> PeerRequestGate {
-    if !fresh {
-        gate.peer_identity_verified = false;
-        if gate.state == PeerState::Active {
-            gate.state = PeerState::Pending;
-        }
-    }
-    gate
-}
-
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
-pub struct InboundDecisionFacts {
-    pub pending: bool,
-    pub digest_matches: bool,
-    pub removed_or_suspended: bool,
-    pub expiry_still_valid: Option<bool>,
-}
-
-pub fn inbound_operator_may_decide(facts: InboundDecisionFacts) -> Result<(), PeerRuleError> {
-    if !facts.pending {
-        return Err(PeerRuleError::InvalidTransition);
-    }
-    if !facts.digest_matches {
-        return Err(PeerRuleError::ManifestMismatch);
-    }
-    if facts.removed_or_suspended {
-        return Err(PeerRuleError::InvalidTransition);
-    }
-    if facts.expiry_still_valid == Some(false) {
-        return Err(PeerRuleError::InvalidTransition);
-    }
-    Ok(())
-}
-
-pub fn digest_matches_current(current: Option<&[u8]>, digest: &[u8]) -> Result<(), PeerRuleError> {
-    match current {
-        None => Err(PeerRuleError::PeerNotFound),
-        Some(value) if value != digest => Err(PeerRuleError::ManifestMismatch),
-        Some(_) => Ok(()),
-    }
-}
-
-pub fn trust_request_may_be_recorded(removed: bool) -> Result<(), PeerRuleError> {
-    if removed {
-        Err(PeerRuleError::InvalidTransition)
-    } else {
-        Ok(())
-    }
-}
-
-pub fn observe_exact_service(expected: &str, observed: &str) -> Result<(), PeerRuleError> {
-    if expected == observed {
-        Ok(())
-    } else {
-        Err(PeerRuleError::ServiceMismatch)
-    }
-}
-
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
-pub struct IdentityFacts<'a> {
-    pub profile_allowed: bool,
-    pub current_digest: Option<&'a [u8]>,
-    pub reported_digest: &'a [u8],
-    pub peer_present: bool,
-    pub removed: bool,
-    pub revision_matches: bool,
-    pub service_matches: bool,
-    pub bootstrap_matches: bool,
-    pub observed_service_matches: bool,
-}
-
-pub fn accept_verified_identity(facts: IdentityFacts<'_>) -> Result<(), PeerRuleError> {
-    if !facts.profile_allowed {
-        return Err(PeerRuleError::EvidenceMismatch);
-    }
-    digest_matches_current(facts.current_digest, facts.reported_digest)?;
-    if !facts.peer_present {
-        return Err(PeerRuleError::PeerNotFound);
-    }
-    if facts.removed
-        || !facts.revision_matches
-        || !facts.service_matches
-        || !facts.bootstrap_matches
-    {
-        return Err(PeerRuleError::EvidenceMismatch);
-    }
-    if !facts.observed_service_matches {
-        return Err(PeerRuleError::EvidenceMismatch);
-    }
-    Ok(())
-}
-
-pub fn remote_decision_service(
-    expected: Option<&str>,
-    observed: &str,
-) -> Result<(), PeerRuleError> {
-    if expected == Some(observed) {
-        Ok(())
-    } else {
-        Err(PeerRuleError::ServiceMismatch)
-    }
-}
-
-pub fn local_operator_may_approve(state: Option<PeerState>) -> Result<(), PeerRuleError> {
-    match state {
-        Some(state) if state != PeerState::Removed => Ok(()),
-        _ => Err(PeerRuleError::InvalidTransition),
-    }
-}
-
-pub fn suspend_transition(state: Option<PeerState>) -> Result<(), PeerRuleError> {
-    match state {
-        Some(PeerState::Active) => Ok(()),
-        _ => Err(PeerRuleError::InvalidTransition),
-    }
-}
-
-pub fn remove_transition(state: Option<PeerState>) -> Result<(), PeerRuleError> {
-    match state {
-        Some(state) if state != PeerState::Removed => Ok(()),
-        _ => Err(PeerRuleError::InvalidTransition),
-    }
-}
-
-pub fn regrant_transition(
-    current: Option<(u64, PeerState)>,
-    revision: u64,
-    service: &str,
-) -> Result<(), PeerRuleError> {
-    if revision == 0 || service.is_empty() {
-        return Err(PeerRuleError::InvalidTransition);
-    }
-    let Some((old_revision, state)) = current else {
-        return Err(PeerRuleError::PeerNotFound);
-    };
-    if state != PeerState::Removed || revision <= old_revision {
-        Err(PeerRuleError::InvalidTransition)
-    } else {
-        Ok(())
     }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::PlatformId;
 
-    fn prior(removed: bool) -> CandidatePrior<'static> {
-        CandidatePrior {
-            revision: 2,
-            digest: &[1; 32],
-            service: "spiffe://peer/control",
-            removed,
+    const CONTROL: &str = "spiffe://provider-b.test/federation/control";
+    const OURS: [u8; 32] = [7; 32];
+
+    fn bootstrap() -> BootstrapAuthority {
+        BootstrapAuthority {
+            peer: PlatformId::new("provider-b").unwrap(),
+            provider_domain: "provider-b.test".into(),
+            expected_control_service_id: CONTROL.into(),
+            expected_control_endpoint: "https://control.provider-b.test/control".into(),
+            expected_edge_service_id: "spiffe://provider-b.test/federation/edge".into(),
+            expected_edge_endpoint: "edge.provider-b.test:8443".into(),
+            expected_bundle_endpoint: "https://bundle.provider-b.test".into(),
+            expected_bundle_profile: "https_spiffe".into(),
+            max_evidence_age_seconds: 3600,
         }
     }
 
+    fn manifest(revision: u64, digest: u8) -> ReceivedManifest {
+        ReceivedManifest { revision, digest: [digest; 32], exact_bytes: vec![digest; 4] }
+    }
+
+    fn delivery() -> BTreeSet<String> {
+        BTreeSet::from([REQUEST_DELIVERY.to_string()])
+    }
+
+    fn active() -> PeerRecord {
+        let mut record = PeerRecord::new(bootstrap());
+        receive_hello(&mut record, manifest(1, 1), CONTROL).unwrap();
+        record_identity(&mut record, [1; 32], Some(1));
+        approve_locally(&mut record).unwrap();
+        receive_trust_decision(&mut record, [1; 32], OURS, TrustDecisionResult::Approved, &delivery()).unwrap();
+        record
+    }
+
     #[test]
-    fn candidate_reset_requires_a_new_revision_and_live_peer() {
+    fn every_peer_state_reads_back_from_storage() {
+        for (text, state) in [
+            ("pending", PeerState::Pending),
+            ("active", PeerState::Active),
+            ("suspended", PeerState::Suspended),
+            ("removing", PeerState::Removing),
+            ("removed", PeerState::Removed),
+        ] {
+            assert_eq!(stored_peer_state(text), Some(state));
+        }
+        assert_eq!(stored_peer_state("ACTIVE"), None);
+    }
+
+    #[test]
+    fn gate_opens_only_with_identity_and_both_approvals() {
+        let mut record = PeerRecord::new(bootstrap());
+        assert_eq!(record.gate(&OURS, None).state, PeerState::Pending);
+        receive_hello(&mut record, manifest(1, 1), CONTROL).unwrap();
+        assert_eq!(approve_locally(&mut record), Err(PeerRuleError::NotVerified));
+        record_identity(&mut record, [1; 32], Some(1));
+        approve_locally(&mut record).unwrap();
+        assert!(!record.gate(&OURS, None).permits_request_delivery());
+        receive_trust_decision(&mut record, [1; 32], OURS, TrustDecisionResult::Approved, &delivery()).unwrap();
+        assert!(record.gate(&OURS, Some(CONTROL)).permits_request_delivery());
+        assert!(!record.gate(&OURS, Some("spiffe://provider-b.test/other")).permits_request_delivery());
+        assert!(!record.gate(&[8; 32], None).permits_request_delivery(), "peer has not approved our new manifest");
+    }
+
+    #[test]
+    fn unannounced_manifest_change_cuts_off_until_revalidated_and_approved() {
+        let mut record = active();
+        assert_eq!(receive_hello(&mut record, manifest(2, 2), CONTROL), Ok(HelloOutcome::Replaced { approval_kept: false }));
+        assert!(!record.gate(&OURS, None).permits_request_delivery());
+        record_identity(&mut record, [2; 32], Some(1));
+        assert!(!record.gate(&OURS, None).permits_request_delivery());
+        approve_locally(&mut record).unwrap();
+        assert!(record.gate(&OURS, None).permits_request_delivery());
+    }
+
+    #[test]
+    fn announced_and_approved_change_switches_after_its_identity_check() {
+        let mut record = active();
+        receive_pending(&mut record, manifest(2, 2), 5_000).unwrap();
+        assert!(record.gate(&OURS, None).permits_request_delivery(), "announcement alone changes nothing");
+        approve_pending(&mut record).unwrap();
+        assert_eq!(receive_hello(&mut record, manifest(2, 2), CONTROL), Ok(HelloOutcome::Replaced { approval_kept: true }));
+        assert!(!record.gate(&OURS, None).permits_request_delivery(), "identity is checked again");
+        record_identity(&mut record, [2; 32], Some(1));
+        assert!(record.gate(&OURS, None).permits_request_delivery());
+        let mut other = active();
+        receive_pending(&mut other, manifest(2, 2), 5_000).unwrap();
+        approve_pending(&mut other).unwrap();
+        assert_eq!(receive_hello(&mut other, manifest(2, 3), CONTROL), Ok(HelloOutcome::Replaced { approval_kept: false }));
+    }
+
+    #[test]
+    fn replays_conflicts_and_old_revisions() {
+        let mut record = active();
+        assert_eq!(receive_hello(&mut record, manifest(1, 1), CONTROL), Ok(HelloOutcome::Unchanged));
+        assert_eq!(receive_hello(&mut record, manifest(1, 9), CONTROL), Err(PeerRuleError::ManifestMismatch));
+        assert_eq!(receive_hello(&mut record, manifest(1, 1), "spiffe://provider-b.test/x"), Err(PeerRuleError::ServiceMismatch));
+        assert_eq!(receive_pending(&mut record, manifest(1, 4), 9), Err(PeerRuleError::InvalidTransition));
+        assert!(record.gate(&OURS, None).permits_request_delivery());
         assert_eq!(
-            plan_candidate(None, 1, &[1; 32], "spiffe://peer/control").unwrap(),
-            CandidatePlan::Insert
-        );
-        assert_eq!(
-            plan_candidate(Some(prior(false)), 2, &[1; 32], "spiffe://peer/control").unwrap(),
-            CandidatePlan::Unchanged
-        );
-        assert_eq!(
-            plan_candidate(Some(prior(false)), 3, &[1; 32], "spiffe://peer/control").unwrap(),
-            CandidatePlan::AdvanceRevision
-        );
-        assert_eq!(
-            plan_candidate(Some(prior(false)), 3, &[2; 32], "spiffe://peer/control").unwrap(),
-            CandidatePlan::ResetApprovals
-        );
-        assert_eq!(
-            plan_candidate(Some(prior(false)), 2, &[2; 32], "spiffe://peer/control"),
+            receive_trust_decision(&mut record, [9; 32], OURS, TrustDecisionResult::Approved, &delivery()),
             Err(PeerRuleError::ManifestMismatch)
         );
+        let wider = BTreeSet::from([REQUEST_DELIVERY.to_string(), "ACCOUNT_LIST".to_string()]);
         assert_eq!(
-            plan_candidate(Some(prior(true)), 3, &[2; 32], "spiffe://peer/control"),
-            Err(PeerRuleError::InvalidTransition)
-        );
-        assert_eq!(
-            plan_candidate(None, 0, &[1; 32], "spiffe://peer/control"),
+            receive_trust_decision(&mut record, [1; 32], OURS, TrustDecisionResult::Approved, &wider),
             Err(PeerRuleError::InvalidTransition)
         );
     }
 
     #[test]
-    fn hello_replay_returns_the_saved_result_and_rejects_altered_bytes() {
-        let prior = PriorInbox {
-            sender: "peer",
-            body_digest: &[1; 32],
-            exact_bytes: b"same",
-            generation: 1,
-            result: "CANDIDATE_SAVED",
-        };
-        assert_eq!(
-            classify_peer_inbox(Some(prior), "peer", &[1; 32], b"same", 1).unwrap(),
-            InboxReplay::Same("CANDIDATE_SAVED")
-        );
-        assert_eq!(
-            classify_peer_inbox(Some(prior), "peer", &[1; 32], b"changed", 1),
-            Err(PeerRuleError::DuplicateMessageConflict)
-        );
-        assert_eq!(
-            accept_hello_generation(None, 2),
-            Err(PeerRuleError::InvalidTransition)
-        );
-        assert_eq!(accept_hello_generation(None, 1), Ok(()));
+    fn suspension_and_removal_close_the_gate() {
+        let mut record = active();
+        suspend(&mut record).unwrap();
+        assert_eq!(record.gate(&OURS, None).state, PeerState::Suspended);
+        resume(&mut record).unwrap();
+        assert!(record.gate(&OURS, None).permits_request_delivery());
+        receive_restriction(&mut record);
+        assert_eq!(record.gate(&OURS, None).state, PeerState::Suspended);
+        receive_trust_decision(&mut record, [1; 32], OURS, TrustDecisionResult::Approved, &delivery()).unwrap();
+        assert!(record.gate(&OURS, None).permits_request_delivery());
+        remove(&mut record);
+        assert_eq!(record.gate(&OURS, None).state, PeerState::Removed);
+        assert_eq!(receive_hello(&mut record, manifest(2, 2), CONTROL), Err(PeerRuleError::Removed));
+        assert_eq!(resume(&mut record), Err(PeerRuleError::InvalidTransition));
     }
 
     #[test]
-    fn trust_request_admits_only_pending_delivery_capability() {
-        let caps = BTreeSet::from(["REQUEST_DELIVERY".to_owned()]);
-        assert_eq!(
-            trust_request_matches(
-                &[1; 32],
-                Some([1; 32]),
-                &[2; 32],
-                Some([2; 32]),
-                &caps,
-                true,
-                true
-            ),
-            Ok(())
-        );
-        assert_eq!(
-            trust_request_matches(
-                &[1; 32],
-                Some([1; 32]),
-                &[2; 32],
-                Some([2; 32]),
-                &caps,
-                false,
-                true
-            ),
-            Err(PeerRuleError::ManifestMismatch)
-        );
-        assert_eq!(
-            trust_request_matches(
-                &[1; 32],
-                Some([1; 32]),
-                &[2; 32],
-                Some([2; 32]),
-                &caps,
-                true,
-                false
-            ),
-            Err(PeerRuleError::InvalidTransition)
-        );
-        assert_eq!(
-            remote_trust_decision(
-                Some([1; 32]),
-                &[1; 32],
-                Some([2; 32]),
-                &[2; 32],
-                TrustDecisionResult::Rejected,
-                &BTreeSet::new()
-            )
-            .unwrap(),
-            RemoteTrustWrite::Reject
-        );
-        assert_eq!(
-            remote_trust_decision(
-                Some([1; 32]),
-                &[1; 32],
-                Some([2; 32]),
-                &[2; 32],
-                TrustDecisionResult::Approved,
-                &BTreeSet::from(["REQUEST_DELIVERY".to_owned(), "ACCOUNT_LIST".to_owned()])
-            ),
-            Err(PeerRuleError::InvalidTransition)
-        );
+    fn identity_is_refreshed_at_half_the_freshness_limit() {
+        let mut record = active();
+        assert!(!identity_needs_refresh(&record, 1_000));
+        assert!(identity_needs_refresh(&record, 1 + 1_800));
+        record_identity(&mut record, [1; 32], None);
+        assert!(!record.gate(&OURS, None).permits_request_delivery());
+        assert!(identity_needs_refresh(&record, 2));
     }
 
     #[test]
-    fn active_gate_requires_every_flag_and_fresh_identity() {
-        assert_eq!(
-            next_pending_state(true, true, true, true),
-            PeerState::Active
-        );
-        assert_eq!(
-            next_pending_state(true, true, false, true),
-            PeerState::Pending
-        );
-        let active = PeerRequestGate {
-            state: PeerState::Active,
-            local_operator_approved: true,
-            remote_operator_approval_confirmed: true,
-            peer_identity_verified: true,
-            exact_service_authenticated: true,
-        };
-        let stale = apply_evidence_freshness(active.clone(), false);
-        assert!(!stale.peer_identity_verified);
-        assert_eq!(stale.state, PeerState::Pending);
-        assert!(!stale.permits_request_delivery());
-        assert!(apply_evidence_freshness(active, true).permits_request_delivery());
-    }
-
-    #[test]
-    fn removal_blocks_requests_and_regrant_starts_only_from_removed() {
-        assert_eq!(
-            trust_request_may_be_recorded(true),
-            Err(PeerRuleError::InvalidTransition)
-        );
-        assert_eq!(
-            regrant_transition(Some((1, PeerState::Removed)), 2, "spiffe://peer/control"),
-            Ok(())
-        );
-        assert_eq!(
-            regrant_transition(Some((1, PeerState::Active)), 2, "spiffe://peer/control"),
-            Err(PeerRuleError::InvalidTransition)
-        );
-        assert_eq!(
-            suspend_transition(Some(PeerState::Pending)),
-            Err(PeerRuleError::InvalidTransition)
-        );
-        assert_eq!(
-            inbound_operator_may_decide(InboundDecisionFacts {
-                pending: true,
-                digest_matches: true,
-                removed_or_suspended: false,
-                expiry_still_valid: Some(false),
-            }),
-            Err(PeerRuleError::InvalidTransition)
-        );
+    fn replacing_the_bootstrap_forgets_learned_state() {
+        let mut record = active();
+        record.replace_bootstrap(bootstrap()).unwrap();
+        assert_eq!(record.generation, 2);
+        assert!(record.current.is_none() && record.remote_approved_digests.is_empty());
+        assert!(!record.gate(&OURS, None).permits_request_delivery());
     }
 }

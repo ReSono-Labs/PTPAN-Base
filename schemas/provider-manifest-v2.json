@@ -1,0 +1,264 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "federation-provider/2",
+  "title": "PTPAN provider manifest",
+  "description": "Describes the provider only, never its customers. Every business field is a claim until the receiver verifies it (D8, D14).",
+  "type": "object",
+  "additionalProperties": false,
+  "required": [
+    "schema",
+    "manifest_id",
+    "revision",
+    "generated_at",
+    "platform",
+    "workload_trust",
+    "federation",
+    "agent_trust",
+    "directory",
+    "application_protocols",
+    "transports"
+  ],
+  "properties": {
+    "schema": {
+      "const": "federation-provider/2"
+    },
+    "manifest_id": {
+      "$ref": "#/$defs/text"
+    },
+    "revision": {
+      "type": "integer",
+      "minimum": 1,
+      "maximum": 9007199254740991
+    },
+    "generated_at": {
+      "$ref": "#/$defs/utc"
+    },
+    "platform": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "platform_id",
+        "display_name",
+        "display_name_source",
+        "operator_name",
+        "website",
+        "documentation_url",
+        "logo_url",
+        "provider_domain"
+      ],
+      "properties": {
+        "platform_id": {
+          "$ref": "#/$defs/id"
+        },
+        "display_name": {
+          "$ref": "#/$defs/text"
+        },
+        "display_name_source": {
+          "enum": [
+            "LOCAL_METADATA",
+            "AI_CATALOG"
+          ]
+        },
+        "operator_name": {
+          "$ref": "#/$defs/text"
+        },
+        "website": {
+          "$ref": "#/$defs/https_url"
+        },
+        "documentation_url": {
+          "oneOf": [
+            {
+              "$ref": "#/$defs/https_url"
+            },
+            {
+              "type": "null"
+            }
+          ]
+        },
+        "logo_url": {
+          "oneOf": [
+            {
+              "$ref": "#/$defs/https_url"
+            },
+            {
+              "type": "null"
+            }
+          ]
+        },
+        "provider_domain": {
+          "$ref": "#/$defs/domain"
+        }
+      }
+    },
+    "workload_trust": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "trust_domain",
+        "bundle_endpoint",
+        "bundle_profile",
+        "control_service_identity",
+        "control_service_role",
+        "edge_service_identity",
+        "edge_service_role"
+      ],
+      "properties": {
+        "trust_domain": {
+          "$ref": "#/$defs/text"
+        },
+        "bundle_endpoint": {
+          "$ref": "#/$defs/https_url"
+        },
+        "bundle_profile": {
+          "$ref": "#/$defs/text"
+        },
+        "control_service_identity": {
+          "$ref": "#/$defs/spiffe_id"
+        },
+        "control_service_role": {
+          "const": "CONTROL"
+        },
+        "edge_service_identity": {
+          "$ref": "#/$defs/spiffe_id"
+        },
+        "edge_service_role": {
+          "const": "EDGE"
+        }
+      }
+    },
+    "federation": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "control_endpoint",
+        "edge_endpoint",
+        "protocols",
+        "base_capabilities"
+      ],
+      "properties": {
+        "control_endpoint": {
+          "$ref": "#/$defs/https_url"
+        },
+        "edge_endpoint": {
+          "type": "string",
+          "maxLength": 260,
+          "pattern": "^[^/@:]+:[0-9]{1,5}$",
+          "description": "host:port of the agent-traffic edge (D11)."
+        },
+        "protocols": {
+          "type": "array",
+          "minItems": 1,
+          "maxItems": 64,
+          "uniqueItems": true,
+          "items": {
+            "type": "string",
+            "pattern": "^[A-Za-z0-9-]+/v?[0-9]+$"
+          },
+          "description": "One entry per supported version (D2)."
+        },
+        "base_capabilities": {
+          "$ref": "#/$defs/list"
+        }
+      }
+    },
+    "agent_trust": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "ca_root"
+      ],
+      "properties": {
+        "ca_root": {
+          "$ref": "#/$defs/ca_root"
+        }
+      }
+    },
+    "directory": {
+      "oneOf": [
+        {
+          "type": "null"
+        },
+        {
+          "type": "object",
+          "additionalProperties": false,
+          "required": [
+            "endpoint",
+            "profile",
+            "record_cids"
+          ],
+          "properties": {
+            "endpoint": {
+              "$ref": "#/$defs/https_url"
+            },
+            "profile": {
+              "$ref": "#/$defs/text"
+            },
+            "record_cids": {
+              "type": "array",
+              "maxItems": 32,
+              "uniqueItems": true,
+              "items": {
+                "$ref": "#/$defs/text"
+              }
+            }
+          }
+        }
+      ],
+      "description": "Optional AGNTCY Directory evidence (D14)."
+    },
+    "application_protocols": {
+      "$ref": "#/$defs/list"
+    },
+    "transports": {
+      "$ref": "#/$defs/list"
+    }
+  },
+  "$defs": {
+    "id": {
+      "type": "string",
+      "minLength": 1,
+      "maxLength": 256
+    },
+    "text": {
+      "type": "string",
+      "minLength": 1,
+      "maxLength": 256,
+      "description": "Bounded text without control characters."
+    },
+    "https_url": {
+      "type": "string",
+      "maxLength": 2048,
+      "pattern": "^https://[^@#]+$"
+    },
+    "utc": {
+      "type": "string",
+      "pattern": "^[0-9]{4}-[0-9]{2}-[0-9]{2}T[0-9]{2}:[0-9]{2}:[0-9]{2}(\\.[0-9]{1,9})?Z$"
+    },
+    "domain": {
+      "type": "string",
+      "maxLength": 253,
+      "pattern": "^[a-z0-9]([a-z0-9-]{0,61}[a-z0-9])?(\\.[a-z0-9]([a-z0-9-]{0,61}[a-z0-9])?)+$",
+      "description": "Lowercase ASCII (punycode) provider domain."
+    },
+    "spiffe_id": {
+      "type": "string",
+      "minLength": 1,
+      "maxLength": 256,
+      "pattern": "^spiffe://"
+    },
+    "ca_root": {
+      "type": "string",
+      "maxLength": 10924,
+      "pattern": "^[A-Za-z0-9+/]+={0,2}$",
+      "description": "Standard base64 DER of the platform's private agent CA root (D13)."
+    },
+    "list": {
+      "type": "array",
+      "maxItems": 64,
+      "uniqueItems": true,
+      "items": {
+        "$ref": "#/$defs/text"
+      }
+    }
+  }
+}

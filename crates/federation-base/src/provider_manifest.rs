@@ -1,14 +1,21 @@
-//! Project-owned provider identity snapshot. AGNTCY Directory publishes
-//! records and routing metadata; it does not define provider business consent.
-//! Every remote business field remains a claim until local evidence verifies it.
+//! Project-owned provider identity snapshot (`federation-provider/2`). It
+//! describes the provider only, never its customers. Every business field is
+//! a claim until the receiver's own checks verify it (identity_evidence).
 
+use crate::encoding::{bounded_text, canonical_digest};
+use crate::address::valid_provider_domain;
+use crate::time::parse_utc;
 use crate::{PlatformId, MAX_JCS_INTEGER};
+use base64::Engine;
+use http::uri::Authority;
 use http::Uri;
 use serde::{Deserialize, Serialize};
-use sha2::{Digest, Sha256};
 use std::collections::BTreeSet;
 
 pub const MAX_MANIFEST_BYTES: usize = 64 << 10;
+pub const MANIFEST_SCHEMA: &str = "federation-provider/2";
+/// Largest accepted agent CA root certificate (DER bytes).
+pub const MAX_CA_ROOT_DER_BYTES: usize = 8 << 10;
 
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
 #[serde(rename_all = "SCREAMING_SNAKE_CASE")]
@@ -27,19 +34,9 @@ pub struct ProviderPlatform {
     pub website: String,
     pub documentation_url: Option<String>,
     pub logo_url: Option<String>,
-}
-
-#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
-#[serde(deny_unknown_fields)]
-pub struct ProviderDiscovery {
-    pub ai_catalog_url: String,
-    pub host_identifier: Option<String>,
-    pub host_trust_manifest_ref: Option<String>,
-    pub directory_endpoint: String,
-    pub directory_profile: String,
-    pub publisher_name_ref: Option<String>,
-    pub record_cids: Vec<String>,
-    pub domain_proof_ref: Option<String>,
+    /// The verified provider domain: the suffix of every address this
+    /// platform issues (D10) and the host of its domain proof (D14).
+    pub provider_domain: String,
 }
 
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
@@ -50,23 +47,37 @@ pub struct WorkloadTrust {
     pub bundle_profile: String,
     pub control_service_identity: String,
     pub control_service_role: String,
+    pub edge_service_identity: String,
+    pub edge_service_role: String,
 }
 
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct FederationEndpoint {
     pub control_endpoint: String,
-    pub control_protocols: Vec<String>,
-    pub relationship_lease_profiles: Vec<String>,
+    /// `host:port` of the agent-traffic edge (D11).
+    pub edge_endpoint: String,
+    /// Supported protocol versions, one entry per version, for example
+    /// `federation-control/v3` or `FRL/1` (D2).
+    pub protocols: Vec<String>,
     pub base_capabilities: Vec<String>,
 }
 
+/// Trust anchor for the platform's agent certificates (D13).
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
-pub struct ProviderSourceRefs {
-    pub identity_evidence: Vec<String>,
-    pub agent_card: Vec<String>,
-    pub ans: Vec<String>,
+pub struct AgentTrust {
+    /// Base64 (standard alphabet, padded) DER of the private CA root.
+    pub ca_root: String,
+}
+
+/// Optional AGNTCY Directory evidence (D14: additional, never required).
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct DirectoryEvidence {
+    pub endpoint: String,
+    pub profile: String,
+    pub record_cids: Vec<String>,
 }
 
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
@@ -77,12 +88,12 @@ pub struct ProviderManifest {
     pub revision: u64,
     pub generated_at: String,
     pub platform: ProviderPlatform,
-    pub discovery: ProviderDiscovery,
     pub workload_trust: WorkloadTrust,
     pub federation: FederationEndpoint,
+    pub agent_trust: AgentTrust,
+    pub directory: Option<DirectoryEvidence>,
     pub application_protocols: Vec<String>,
     pub transports: Vec<String>,
-    pub source_refs: ProviderSourceRefs,
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -113,9 +124,8 @@ pub fn parse_manifest(bytes: &[u8]) -> Result<ManifestSnapshot, ManifestError> {
     let manifest: ProviderManifest =
         serde_json::from_slice(bytes).map_err(|_| ManifestError::InvalidJson)?;
     manifest.validate()?;
-    let canonical_bytes =
-        serde_json_canonicalizer::to_vec(&manifest).map_err(|_| ManifestError::Canonicalization)?;
-    let digest = Sha256::digest(&canonical_bytes).into();
+    let (canonical_bytes, digest) =
+        canonical_digest(&manifest).ok_or(ManifestError::Canonicalization)?;
     Ok(ManifestSnapshot {
         manifest,
         exact_bytes: bytes.to_vec(),
@@ -124,9 +134,58 @@ pub fn parse_manifest(bytes: &[u8]) -> Result<ManifestSnapshot, ManifestError> {
     })
 }
 
+/// Decode an agent CA root: padded standard base64 of a DER structure.
+pub fn decode_ca_root(value: &str) -> Option<Vec<u8>> {
+    let der = base64::engine::general_purpose::STANDARD.decode(value).ok()?;
+    (der.len() >= 64 && der.len() <= MAX_CA_ROOT_DER_BYTES && der[0] == 0x30).then_some(der)
+}
+
+/// `name/version` with an optional `v`, for example `federation-peer/v2`.
+fn protocol_entry(value: &str) -> Option<(&str, u32)> {
+    let (name, version) = value.split_once('/')?;
+    let digits = version.strip_prefix('v').unwrap_or(version);
+    let valid_name = !name.is_empty()
+        && name
+            .bytes()
+            .all(|b| b.is_ascii_alphanumeric() || b == b'-');
+    if !valid_name || digits.is_empty() || !digits.bytes().all(|b| b.is_ascii_digit()) {
+        return None;
+    }
+    Some((name, digits.parse().ok()?))
+}
+
+/// Highest common version for every protocol family in `local` (D2). Fails
+/// with the first family the peer does not share.
+pub fn negotiate_protocols<'a>(
+    local: &[&'a str],
+    remote: &[String],
+) -> Result<Vec<&'a str>, &'a str> {
+    let mut families: Vec<&str> = Vec::new();
+    for entry in local {
+        if let Some((name, _)) = protocol_entry(entry) {
+            if !families.contains(&name) {
+                families.push(name);
+            }
+        }
+    }
+    let mut selected = Vec::new();
+    for family in families {
+        let best = local
+            .iter()
+            .filter(|entry| protocol_entry(entry).is_some_and(|(name, _)| name == family))
+            .filter(|entry| remote.iter().any(|r| r == **entry))
+            .max_by_key(|entry| protocol_entry(entry).map(|(_, v)| v));
+        match best {
+            Some(entry) => selected.push(*entry),
+            None => return Err(family),
+        }
+    }
+    Ok(selected)
+}
+
 impl ProviderManifest {
     pub fn validate(&self) -> Result<(), ManifestError> {
-        if self.schema != "federation-provider/1" {
+        if self.schema != MANIFEST_SCHEMA {
             return Err(ManifestError::InvalidSchema);
         }
         if self.revision == 0 || self.revision > MAX_JCS_INTEGER {
@@ -137,99 +196,43 @@ impl ProviderManifest {
         bounded(&self.platform.display_name, "platform.display_name")?;
         bounded(&self.platform.operator_name, "platform.operator_name")?;
         https_url(&self.platform.website, "platform.website")?;
-        optional_url(
-            &self.platform.documentation_url,
-            "platform.documentation_url",
-        )?;
+        optional_url(&self.platform.documentation_url, "platform.documentation_url")?;
         optional_url(&self.platform.logo_url, "platform.logo_url")?;
-        https_url(&self.discovery.ai_catalog_url, "discovery.ai_catalog_url")?;
-        https_url(
-            &self.discovery.directory_endpoint,
-            "discovery.directory_endpoint",
-        )?;
-        bounded(
-            &self.discovery.directory_profile,
-            "discovery.directory_profile",
-        )?;
-        optional_bounded(&self.discovery.host_identifier, "discovery.host_identifier")?;
-        optional_bounded(
-            &self.discovery.host_trust_manifest_ref,
-            "discovery.host_trust_manifest_ref",
-        )?;
-        optional_bounded(
-            &self.discovery.publisher_name_ref,
-            "discovery.publisher_name_ref",
-        )?;
-        optional_bounded(
-            &self.discovery.domain_proof_ref,
-            "discovery.domain_proof_ref",
-        )?;
-        if self.discovery.record_cids.len() > 32 {
-            return Err(ManifestError::InvalidField("discovery.record_cids"));
+        if !valid_provider_domain(&self.platform.provider_domain) {
+            return Err(ManifestError::InvalidField("platform.provider_domain"));
         }
-        for value in &self.discovery.record_cids {
-            bounded(value, "discovery.record_cids")?;
+        let trust = &self.workload_trust;
+        bounded(&trust.trust_domain, "workload_trust.trust_domain")?;
+        https_url(&trust.bundle_endpoint, "workload_trust.bundle_endpoint")?;
+        bounded(&trust.bundle_profile, "workload_trust.bundle_profile")?;
+        bounded(&trust.control_service_identity, "workload_trust.control_service_identity")?;
+        bounded(&trust.control_service_role, "workload_trust.control_service_role")?;
+        bounded(&trust.edge_service_identity, "workload_trust.edge_service_identity")?;
+        bounded(&trust.edge_service_role, "workload_trust.edge_service_role")?;
+        if trust.edge_service_identity == trust.control_service_identity {
+            return Err(ManifestError::InvalidField("workload_trust.edge_service_identity"));
         }
-        bounded(
-            &self.workload_trust.trust_domain,
-            "workload_trust.trust_domain",
-        )?;
-        https_url(
-            &self.workload_trust.bundle_endpoint,
-            "workload_trust.bundle_endpoint",
-        )?;
-        bounded(
-            &self.workload_trust.bundle_profile,
-            "workload_trust.bundle_profile",
-        )?;
-        bounded(
-            &self.workload_trust.control_service_identity,
-            "workload_trust.control_service_identity",
-        )?;
-        bounded(
-            &self.workload_trust.control_service_role,
-            "workload_trust.control_service_role",
-        )?;
-        https_url(
-            &self.federation.control_endpoint,
-            "federation.control_endpoint",
-        )?;
-        list(
-            &self.federation.control_protocols,
-            "federation.control_protocols",
-            true,
-        )?;
-        list(
-            &self.federation.relationship_lease_profiles,
-            "federation.relationship_lease_profiles",
-            true,
-        )?;
-        list(
-            &self.federation.base_capabilities,
-            "federation.base_capabilities",
-            false,
-        )?;
+        https_url(&self.federation.control_endpoint, "federation.control_endpoint")?;
+        host_port(&self.federation.edge_endpoint, "federation.edge_endpoint")?;
+        list(&self.federation.protocols, "federation.protocols", true)?;
+        if self.federation.protocols.iter().any(|p| protocol_entry(p).is_none()) {
+            return Err(ManifestError::InvalidField("federation.protocols"));
+        }
+        list(&self.federation.base_capabilities, "federation.base_capabilities", false)?;
+        if decode_ca_root(&self.agent_trust.ca_root).is_none() {
+            return Err(ManifestError::InvalidField("agent_trust.ca_root"));
+        }
+        if let Some(directory) = &self.directory {
+            https_url(&directory.endpoint, "directory.endpoint")?;
+            bounded(&directory.profile, "directory.profile")?;
+            if directory.record_cids.len() > 32 {
+                return Err(ManifestError::InvalidField("directory.record_cids"));
+            }
+            list(&directory.record_cids, "directory.record_cids", false)?;
+        }
         list(&self.application_protocols, "application_protocols", false)?;
         list(&self.transports, "transports", false)?;
-        list(
-            &self.source_refs.identity_evidence,
-            "source_refs.identity_evidence",
-            false,
-        )?;
-        list(
-            &self.source_refs.agent_card,
-            "source_refs.agent_card",
-            false,
-        )?;
-        list(&self.source_refs.ans, "source_refs.ans", false)?;
-        if self.source_refs.identity_evidence.len()
-            + self.source_refs.agent_card.len()
-            + self.source_refs.ans.len()
-            > 32
-        {
-            return Err(ManifestError::InvalidField("source_refs"));
-        }
-        utc_timestamp(&self.generated_at)?;
+        parse_utc(&self.generated_at).ok_or(ManifestError::InvalidTime)?;
         Ok(())
     }
 
@@ -249,18 +252,24 @@ impl ProviderManifest {
     }
 }
 
-fn bounded(value: &str, field: &'static str) -> Result<(), ManifestError> {
-    if value.is_empty() || value.len() > 256 || value.chars().any(char::is_control) {
-        Err(ManifestError::InvalidField(field))
-    } else {
-        Ok(())
-    }
-}
-fn optional_bounded(value: &Option<String>, field: &'static str) -> Result<(), ManifestError> {
-    if let Some(value) = value {
-        bounded(value, field)?;
+fn host_port(value: &str, field: &'static str) -> Result<(), ManifestError> {
+    let authority: Authority = value.parse().map_err(|_| ManifestError::InvalidField(field))?;
+    if authority.as_str() != value
+        || authority.as_str().contains('@')
+        || authority.host().is_empty()
+        || authority.port_u16().is_none_or(|port| port == 0)
+    {
+        return Err(ManifestError::InvalidField(field));
     }
     Ok(())
+}
+
+fn bounded(value: &str, field: &'static str) -> Result<(), ManifestError> {
+    if bounded_text(value) {
+        Ok(())
+    } else {
+        Err(ManifestError::InvalidField(field))
+    }
 }
 fn https_url(value: &str, field: &'static str) -> Result<(), ManifestError> {
     let parsed: Uri = value
@@ -296,83 +305,20 @@ fn list(values: &[String], field: &'static str, required: bool) -> Result<(), Ma
     Ok(())
 }
 
-#[derive(Clone, Copy, Debug, Eq, PartialEq, Ord, PartialOrd)]
-pub(crate) struct UtcInstant(
-    pub u32,
-    pub u32,
-    pub u32,
-    pub u32,
-    pub u32,
-    pub u32,
-    pub u32,
-);
-
-pub(crate) fn utc_timestamp(value: &str) -> Result<UtcInstant, ManifestError> {
-    let b = value.as_bytes();
-    if b.len() < 20
-        || b[4] != b'-'
-        || b[7] != b'-'
-        || b[10] != b'T'
-        || b[13] != b':'
-        || b[16] != b':'
-        || *b.last().unwrap() != b'Z'
-    {
-        return Err(ManifestError::InvalidTime);
-    }
-    for (index, byte) in b.iter().enumerate() {
-        if matches!(index, 4 | 7 | 10 | 13 | 16)
-            || index == b.len() - 1
-            || (b.len() > 20 && index == 19)
-        {
-            continue;
-        }
-        if !byte.is_ascii_digit() {
-            return Err(ManifestError::InvalidTime);
-        }
-    }
-    if b.len() > 20 && (b[19] != b'.' || b.len() > 30 || b.len() < 22) {
-        return Err(ManifestError::InvalidTime);
-    }
-    let part = |range: std::ops::Range<usize>| -> Result<u32, ManifestError> {
-        std::str::from_utf8(&b[range])
-            .map_err(|_| ManifestError::InvalidTime)?
-            .parse()
-            .map_err(|_| ManifestError::InvalidTime)
-    };
-    let year = part(0..4)?;
-    let month = part(5..7)?;
-    let day = part(8..10)?;
-    let hour = part(11..13)?;
-    let minute = part(14..16)?;
-    let second = part(17..19)?;
-    let leap = year % 4 == 0 && (year % 100 != 0 || year % 400 == 0);
-    let days = match month {
-        1 | 3 | 5 | 7 | 8 | 10 | 12 => 31,
-        4 | 6 | 9 | 11 => 30,
-        2 if leap => 29,
-        2 => 28,
-        _ => 0,
-    };
-    if year == 0 || day == 0 || day > days || hour > 23 || minute > 59 || second > 59 {
-        return Err(ManifestError::InvalidTime);
-    }
-    let fraction = if b.len() > 20 {
-        let digits = &value[20..value.len() - 1];
-        let parsed: u32 = digits.parse().map_err(|_| ManifestError::InvalidTime)?;
-        parsed * 10u32.pow(9 - digits.len() as u32)
-    } else {
-        0
-    };
-    Ok(UtcInstant(year, month, day, hour, minute, second, fraction))
-}
-
 #[cfg(test)]
-mod tests {
+pub(crate) mod tests {
     use super::*;
 
-    fn valid() -> ProviderManifest {
+    /// A DER-shaped placeholder for the agent CA root (structure only).
+    pub(crate) fn test_ca_root() -> String {
+        let mut der = vec![0x30, 0x82, 0x01, 0x00];
+        der.resize(260, 0x5a);
+        base64::engine::general_purpose::STANDARD.encode(der)
+    }
+
+    pub(crate) fn valid() -> ProviderManifest {
         ProviderManifest {
-            schema: "federation-provider/1".into(),
+            schema: MANIFEST_SCHEMA.into(),
             manifest_id: "manifest-b-1".into(),
             revision: 1,
             generated_at: "2026-09-23T08:00:00Z".into(),
@@ -381,40 +327,30 @@ mod tests {
                 display_name: "Provider B".into(),
                 display_name_source: ClaimSource::LocalMetadata,
                 operator_name: "B Example LLC".into(),
-                website: "https://b.test".into(),
+                website: "https://provider-b.test".into(),
                 documentation_url: None,
                 logo_url: None,
-            },
-            discovery: ProviderDiscovery {
-                ai_catalog_url: "https://catalog.b.test".into(),
-                host_identifier: None,
-                host_trust_manifest_ref: None,
-                directory_endpoint: "https://directory.b.test".into(),
-                directory_profile: "SPIRE_X509".into(),
-                publisher_name_ref: None,
-                record_cids: vec![],
-                domain_proof_ref: None,
+                provider_domain: "provider-b.test".into(),
             },
             workload_trust: WorkloadTrust {
                 trust_domain: "provider-b.test".into(),
-                bundle_endpoint: "https://bundle.b.test".into(),
+                bundle_endpoint: "https://bundle.provider-b.test".into(),
                 bundle_profile: "https_spiffe".into(),
                 control_service_identity: "spiffe://provider-b.test/federation/control".into(),
                 control_service_role: "CONTROL".into(),
+                edge_service_identity: "spiffe://provider-b.test/federation/edge".into(),
+                edge_service_role: "EDGE".into(),
             },
             federation: FederationEndpoint {
-                control_endpoint: "https://control.b.test/control".into(),
-                control_protocols: vec!["federation-control/v1".into()],
-                relationship_lease_profiles: vec!["FRL/1".into()],
+                control_endpoint: "https://control.provider-b.test/control".into(),
+                edge_endpoint: "edge.provider-b.test:8443".into(),
+                protocols: crate::SUPPORTED_PROTOCOLS.map(String::from).to_vec(),
                 base_capabilities: vec![],
             },
-            application_protocols: vec![],
-            transports: vec![],
-            source_refs: ProviderSourceRefs {
-                identity_evidence: vec![],
-                agent_card: vec![],
-                ans: vec![],
-            },
+            agent_trust: AgentTrust { ca_root: test_ca_root() },
+            directory: None,
+            application_protocols: vec!["a2a/1".into()],
+            transports: vec!["tls13".into()],
         }
     }
 
@@ -424,18 +360,15 @@ mod tests {
         let snapshot = parse_manifest(&raw).unwrap();
         assert_eq!(snapshot.exact_bytes, raw);
         assert_ne!(snapshot.digest, [0; 32]);
+        let b = PlatformId::new("provider-b").unwrap();
         snapshot
             .manifest
-            .check_authenticated_binding(
-                &PlatformId::new("provider-b").unwrap(),
-                "spiffe://provider-b.test/federation/control",
-            )
+            .check_authenticated_binding(&b, "spiffe://provider-b.test/federation/control")
             .unwrap();
         assert_eq!(
-            snapshot.manifest.check_authenticated_binding(
-                &PlatformId::new("provider-b").unwrap(),
-                "spiffe://provider-b.test/other"
-            ),
+            snapshot
+                .manifest
+                .check_authenticated_binding(&b, "spiffe://provider-b.test/federation/edge"),
             Err(ManifestError::WrongService)
         );
     }
@@ -444,30 +377,66 @@ mod tests {
     fn duplicate_unknown_customer_field_and_malformed_claims_fail() {
         let raw = serde_json::to_string(&valid()).unwrap();
         assert_eq!(
-            parse_manifest(
-                raw.replace("\"revision\":1", "\"revision\":1,\"revision\":2")
-                    .as_bytes()
-            ),
+            parse_manifest(raw.replace("\"revision\":1", "\"revision\":1,\"revision\":2").as_bytes()),
             Err(ManifestError::InvalidJson)
         );
         assert_eq!(
-            parse_manifest(
-                raw.replace(
-                    "\"operator_name\":",
-                    "\"account_inventory\":[],\"operator_name\":"
-                )
-                .as_bytes()
-            ),
+            parse_manifest(raw.replace("\"operator_name\":", "\"account_inventory\":[],\"operator_name\":").as_bytes()),
             Err(ManifestError::InvalidJson)
         );
-        let mut bad = valid();
-        bad.discovery.directory_endpoint = "http://directory.b.test".into();
         assert_eq!(
-            bad.validate(),
-            Err(ManifestError::InvalidField("discovery.directory_endpoint"))
+            parse_manifest(raw.replace(MANIFEST_SCHEMA, "federation-provider/1").as_bytes()),
+            Err(ManifestError::InvalidSchema)
         );
-        bad = valid();
-        bad.generated_at = "2026-09-23T04:00:00-04:00".into();
-        assert_eq!(bad.validate(), Err(ManifestError::InvalidTime));
+        type Case = (fn(&mut ProviderManifest), ManifestError);
+        let cases: [Case; 7] = [
+            (|m| m.generated_at = "2026-09-23T04:00:00-04:00".into(), ManifestError::InvalidTime),
+            (|m| m.federation.edge_endpoint = "https://edge.provider-b.test:8443".into(), ManifestError::InvalidField("federation.edge_endpoint")),
+            (|m| m.federation.edge_endpoint = "edge.provider-b.test".into(), ManifestError::InvalidField("federation.edge_endpoint")),
+            (|m| m.federation.protocols = vec!["federation-control".into()], ManifestError::InvalidField("federation.protocols")),
+            (|m| m.agent_trust.ca_root = "bm90IGEgY2VydA==".into(), ManifestError::InvalidField("agent_trust.ca_root")),
+            (|m| m.platform.provider_domain = "Provider-B.test".into(), ManifestError::InvalidField("platform.provider_domain")),
+            (|m| m.workload_trust.edge_service_identity = m.workload_trust.control_service_identity.clone(), ManifestError::InvalidField("workload_trust.edge_service_identity")),
+        ];
+        for (change, error) in cases {
+            let mut bad = valid();
+            change(&mut bad);
+            assert_eq!(bad.validate(), Err(error));
+        }
+        let mut with_directory = valid();
+        with_directory.directory = Some(DirectoryEvidence {
+            endpoint: "http://directory.provider-b.test".into(),
+            profile: "SPIRE_X509".into(),
+            record_cids: vec![],
+        });
+        assert_eq!(with_directory.validate(), Err(ManifestError::InvalidField("directory.endpoint")));
+    }
+
+    #[test]
+    fn checked_in_schema_matches_the_wire_type() {
+        let schema: serde_json::Value =
+            serde_json::from_str(include_str!("../../../schemas/provider-manifest-v2.json")).unwrap();
+        assert_eq!(schema["$id"], MANIFEST_SCHEMA);
+        let mut with_directory = valid();
+        with_directory.directory = Some(DirectoryEvidence {
+            endpoint: "https://directory.provider-b.test".into(),
+            profile: "SPIRE_X509".into(),
+            record_cids: vec!["bafy".into()],
+        });
+        for manifest in [valid(), with_directory] {
+            let value = serde_json::to_value(&manifest).unwrap();
+            crate::schema_check::matches(&schema, &schema, &value, "manifest");
+        }
+    }
+
+    #[test]
+    fn negotiation_picks_the_highest_common_version_per_family() {
+        let local = ["federation-control/v3", "federation-control/v4", "FRL/1"];
+        let remote = vec!["federation-control/v3".to_string(), "federation-control/v4".into(), "FRL/1".into()];
+        assert_eq!(negotiate_protocols(&local, &remote), Ok(vec!["federation-control/v4", "FRL/1"]));
+        let older = vec!["federation-control/v3".to_string(), "FRL/1".into()];
+        assert_eq!(negotiate_protocols(&local, &older), Ok(vec!["federation-control/v3", "FRL/1"]));
+        let missing = vec!["federation-control/v2".to_string(), "FRL/1".into()];
+        assert_eq!(negotiate_protocols(&local, &missing), Err("federation-control"));
     }
 }

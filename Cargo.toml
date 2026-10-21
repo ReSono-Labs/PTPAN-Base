@@ -1,3 +1,3 @@
 [workspace]
-members = ["crates/federation-base", "crates/federation-store", "crates/federation-ipc"]
-resolver = "2"
+members = ["crates/federation-base", "crates/federation-ipc", "crates/ptpan-platform-api", "crates/ptpan-adapter", "crates/ptpan-conformance", "crates/ptpan-test-support", "reference-platform"]
+resolver = "3"

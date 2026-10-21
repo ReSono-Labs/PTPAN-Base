@@ -1,0 +1,15 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "ptpan-ingress/1",
+  "title": "PTPAN local ingress header",
+  "description": "The one length-prefixed frame the bridge writes to the platform's ingress socket before an admitted agent stream (D11). The platform resolves destination_address with its internal resolver and carries the bytes that follow to that agent without decrypting them, until deadline (unix seconds).",
+  "type": "object",
+  "additionalProperties": false,
+  "required": ["schema", "relationship_id", "destination_address", "deadline"],
+  "properties": {
+    "schema": {"const": "ptpan-ingress/1"},
+    "relationship_id": {"type": "string", "minLength": 1, "maxLength": 256},
+    "destination_address": {"type": "string", "maxLength": 253, "pattern": "^(?=[A-Za-z0-9.-]*\\.)[A-Za-z0-9-][A-Za-z0-9.-]{0,251}[A-Za-z0-9-]$"},
+    "deadline": {"type": "integer", "minimum": 1}
+  }
+}

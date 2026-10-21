@@ -1,33 +1,71 @@
-//! Locally computed provider authority checks. Directory naming verifies a
-//! record's domain key and go-spiffe verifies a workload service. Neither
-//! alone verifies a legal business or grants operator trust.
+//! Locally computed provider identity checks (D14). A peer is verified only
+//! when the authenticated control service, the provider manifest, the local
+//! bootstrap and the provider's HTTPS well-known domain document all agree.
+//! A certificate, a document or an operator approval alone never opens trust.
 
-use crate::provider_manifest::{utc_timestamp, ManifestSnapshot};
+use crate::address::valid_provider_domain;
+use crate::encoding::{bounded_text, canonical_digest, sha256};
+use crate::provider_manifest::{decode_ca_root, negotiate_protocols, ManifestSnapshot};
+use crate::time::{parse_utc, MAX_CLOCK_SKEW_SECONDS};
 use crate::PlatformId;
 use http::Uri;
 use serde::{Deserialize, Serialize};
-use sha2::{Digest, Sha256};
+
+pub const DOMAIN_DOCUMENT_SCHEMA: &str = "ptpan-provider-domain/1";
+pub const WELL_KNOWN_PATH: &str = "/.well-known/ptpan-provider.json";
+pub const MAX_DOMAIN_DOCUMENT_BYTES: usize = 16 << 10;
+/// Largest accepted bootstrap evidence age (seven days).
+pub const MAX_EVIDENCE_AGE_SECONDS: i64 = 604_800;
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize, Deserialize)]
 #[serde(rename_all = "SCREAMING_SNAKE_CASE")]
 pub enum EvidenceProfile {
+    /// The document was fetched over HTTPS with WebPKI validation.
     ProductionHttps,
+    /// Isolated test stacks only: plain HTTP on a test domain.
     LocalHttpTest,
 }
 
-/// The Go bridge must populate this from the selected Directory SDK's
-/// GetVerificationInfo and Pull on an exact-ID authenticated connection.
+/// The provider's own statement on its domain (D14). It publishes only the
+/// platform ID, its two service identities and its agent CA root.
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
-pub struct DirectoryNameEvidence {
-    pub record_cid: String,
-    pub record_name: String,
-    pub verified: bool,
-    pub domain: String,
-    pub method: String,
-    pub key_id: String,
-    pub verified_at: String,
-    pub source_directory_service_id: String,
+pub struct ProviderDomainDocument {
+    pub schema: String,
+    pub platform_id: PlatformId,
+    pub control_service_identity: String,
+    pub edge_service_identity: String,
+    pub agent_ca_root: String,
+}
+
+/// What the bridge fetched. The bridge performs the HTTPS and WebPKI checks;
+/// Base checks the location, the content and freshness.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct DomainProofEvidence {
+    pub url: String,
+    pub fetched_at: String,
+    pub body: Vec<u8>,
+}
+
+pub fn well_known_url(provider_domain: &str, profile: EvidenceProfile) -> String {
+    let scheme = match profile {
+        EvidenceProfile::ProductionHttps => "https",
+        EvidenceProfile::LocalHttpTest => "http",
+    };
+    format!("{scheme}://{provider_domain}{WELL_KNOWN_PATH}")
+}
+
+pub fn parse_domain_document(bytes: &[u8]) -> Option<ProviderDomainDocument> {
+    if bytes.is_empty() || bytes.len() > MAX_DOMAIN_DOCUMENT_BYTES {
+        return None;
+    }
+    let document: ProviderDomainDocument = serde_json::from_slice(bytes).ok()?;
+    (document.schema == DOMAIN_DOCUMENT_SCHEMA
+        && bounded_text(document.platform_id.as_str())
+        && bounded_text(&document.control_service_identity)
+        && bounded_text(&document.edge_service_identity)
+        && decode_ca_root(&document.agent_ca_root).is_some())
+    .then_some(document)
 }
 
 /// Independently provisioned local operator bootstrap expectations. These
@@ -39,8 +77,8 @@ pub struct BootstrapAuthority {
     pub provider_domain: String,
     pub expected_control_service_id: String,
     pub expected_control_endpoint: String,
-    pub expected_directory_endpoint: String,
-    pub expected_local_directory_service_id: String,
+    pub expected_edge_service_id: String,
+    pub expected_edge_endpoint: String,
     pub expected_bundle_endpoint: String,
     pub expected_bundle_profile: String,
     pub max_evidence_age_seconds: i64,
@@ -48,9 +86,9 @@ pub struct BootstrapAuthority {
 
 impl BootstrapAuthority {
     pub fn digest(&self) -> [u8; 32] {
-        let bytes =
-            serde_json_canonicalizer::to_vec(self).expect("bootstrap authority serialization");
-        Sha256::digest(&bytes).into()
+        canonical_digest(self)
+            .expect("bootstrap authority serialization")
+            .1
     }
 }
 
@@ -60,10 +98,9 @@ pub enum IdentityError {
     WrongService,
     WrongDomain,
     WrongEndpoint,
-    WrongDirectory,
+    UnsupportedProtocol,
     WrongBundle,
-    WrongRecord,
-    UnverifiedName,
+    WrongDomainDocument,
     StaleOrInvalidEvidence,
     UnsupportedProfile,
 }
@@ -107,9 +144,11 @@ pub struct VerifiedProviderBinding {
     manifest_digest: [u8; 32],
     observed_control_service_id: String,
     verified_domain: String,
-    record_cid: String,
-    key_id: String,
-    source_directory_service_id: String,
+    edge_service_id: String,
+    edge_endpoint: String,
+    agent_ca_root: String,
+    negotiated_protocols: Vec<String>,
+    domain_document_digest: [u8; 32],
     verified_at: String,
     profile: EvidenceProfile,
     bootstrap_digest: [u8; 32],
@@ -132,14 +171,20 @@ impl VerifiedProviderBinding {
     pub fn verified_domain(&self) -> &str {
         &self.verified_domain
     }
-    pub fn record_cid(&self) -> &str {
-        &self.record_cid
+    pub fn edge_service_id(&self) -> &str {
+        &self.edge_service_id
     }
-    pub fn key_id(&self) -> &str {
-        &self.key_id
+    pub fn edge_endpoint(&self) -> &str {
+        &self.edge_endpoint
     }
-    pub fn source_directory_service_id(&self) -> &str {
-        &self.source_directory_service_id
+    pub fn agent_ca_root(&self) -> &str {
+        &self.agent_ca_root
+    }
+    pub fn negotiated_protocols(&self) -> &[String] {
+        &self.negotiated_protocols
+    }
+    pub fn domain_document_digest(&self) -> [u8; 32] {
+        self.domain_document_digest
     }
     pub fn verified_at(&self) -> &str {
         &self.verified_at
@@ -155,718 +200,196 @@ impl VerifiedProviderBinding {
     }
 }
 
-pub fn verify_provider_binding(
-    snapshot: &ManifestSnapshot,
-    bootstrap: &BootstrapAuthority,
-    observed_control_service_id: &str,
-    evidence: &DirectoryNameEvidence,
-    profile: EvidenceProfile,
-    now_unix_seconds: i64,
-) -> Result<VerifiedProviderBinding, IdentityError> {
-    evaluate_provider_identity(
-        snapshot,
-        bootstrap,
-        observed_control_service_id,
-        evidence,
-        profile,
-        now_unix_seconds,
-    )
-    .binding
+/// One equality check: field, observed value, expected value, the property a
+/// match verifies, and the error a mismatch raises.
+struct Check<'a> {
+    field: &'static str,
+    observed: &'a str,
+    matches: bool,
+    source: &'static str,
+    property: &'static str,
+    error: IdentityError,
+    reason: &'static str,
 }
 
-/// Field observations are produced even when the binding is rejected. A later
-/// failed check does not mark unchecked fields verified.
+/// Field observations are produced even when the binding is rejected. Checks
+/// run in order and stop at the first mismatch, so a field after a failed
+/// check is never marked verified.
 pub fn evaluate_provider_identity(
     snapshot: &ManifestSnapshot,
     bootstrap: &BootstrapAuthority,
     observed_control_service_id: &str,
-    evidence: &DirectoryNameEvidence,
+    evidence: &DomainProofEvidence,
     profile: EvidenceProfile,
+    local_protocols: &[&str],
     now_unix_seconds: i64,
 ) -> IdentityEvaluation {
     let manifest = &snapshot.manifest;
     let revision = manifest.revision;
     let claimed_at = manifest.generated_at.as_str();
     let mut observations = Vec::new();
-    note(
-        &mut observations,
-        "platform.operator_name",
-        &manifest.platform.operator_name,
-        "manifest",
-        claimed_at,
-        revision,
-        None,
-        ObservationResult::SelfDeclared,
-        None,
-        "local operator name is a claim, not independent identity proof",
-    );
-    match manifest.platform.display_name_source {
-        crate::provider_manifest::ClaimSource::LocalMetadata => note(
-            &mut observations,
-            "platform.display_name",
-            &manifest.platform.display_name,
-            "manifest",
-            claimed_at,
-            revision,
-            None,
-            ObservationResult::SelfDeclared,
-            None,
-            "display name is local metadata",
-        ),
-        crate::provider_manifest::ClaimSource::AiCatalog => note(
-            &mut observations,
-            "platform.display_name",
-            &manifest.platform.display_name,
-            "ai-catalog",
-            claimed_at,
-            revision,
-            None,
-            ObservationResult::ReviewRequired,
-            None,
-            "catalog display name is not operator identity",
-        ),
-    }
-    if manifest.platform.platform_id != bootstrap.peer {
-        note(
-            &mut observations,
-            "platform.platform_id",
-            manifest.platform.platform_id.as_str(),
-            "local-bootstrap",
-            claimed_at,
-            revision,
-            None,
-            ObservationResult::Mismatch,
-            None,
-            "manifest platform id does not match the bootstrap peer",
-        );
-        return IdentityEvaluation {
-            observations,
-            binding: Err(IdentityError::WrongPeer),
-        };
-    }
-    note(
-        &mut observations,
-        "platform.platform_id",
-        manifest.platform.platform_id.as_str(),
-        "local-bootstrap",
-        claimed_at,
-        revision,
-        None,
-        ObservationResult::Verified,
-        Some("platform-binding"),
-        "manifest platform id matches the local bootstrap peer",
-    );
+    note(&mut observations, revision, "platform.operator_name", &manifest.platform.operator_name, "manifest", claimed_at, None,
+        ObservationResult::SelfDeclared, None, "operator name is a claim, not identity proof");
+    let (display_source, display_result, display_reason) = match manifest.platform.display_name_source {
+        crate::provider_manifest::ClaimSource::LocalMetadata => ("manifest", ObservationResult::SelfDeclared, "display name is local metadata"),
+        crate::provider_manifest::ClaimSource::AiCatalog => ("ai-catalog", ObservationResult::ReviewRequired, "catalog display name is not operator identity"),
+    };
+    note(&mut observations, revision, "platform.display_name", &manifest.platform.display_name, display_source, claimed_at, None,
+        display_result, None, display_reason);
 
-    let mut error = None;
-    let service_prefix = format!("spiffe://{}/", bootstrap.provider_domain);
-    if observed_control_service_id != bootstrap.expected_control_service_id
-        || !observed_control_service_id.starts_with(&service_prefix)
-    {
-        note(
-            &mut observations,
-            "authenticated_control_service",
-            observed_control_service_id,
-            "authenticated-service",
-            claimed_at,
-            revision,
-            None,
-            ObservationResult::Mismatch,
-            None,
-            "authenticated service is not the bootstrap control service in its provider domain",
-        );
-        error = Some(IdentityError::WrongService);
-    } else {
-        note(
-            &mut observations,
-            "authenticated_control_service",
-            observed_control_service_id,
-            "authenticated-service",
-            claimed_at,
-            revision,
-            None,
-            ObservationResult::Verified,
-            Some("exact-service-authentication"),
-            "authenticated SPIFFE ID matches the bootstrap control service",
-        );
-    }
-    if manifest.workload_trust.control_service_identity != bootstrap.expected_control_service_id {
-        note(
-            &mut observations,
-            "workload_trust.control_service_identity",
-            &manifest.workload_trust.control_service_identity,
-            "local-bootstrap",
-            claimed_at,
-            revision,
-            None,
-            ObservationResult::Mismatch,
-            None,
-            "manifest control service does not match the bootstrap service",
-        );
-        let _ = error.get_or_insert(IdentityError::WrongService);
-    } else if error.is_none() {
-        note(
-            &mut observations,
-            "workload_trust.control_service_identity",
-            &manifest.workload_trust.control_service_identity,
-            "manifest",
-            claimed_at,
-            revision,
-            None,
-            ObservationResult::Verified,
-            Some("exact-service-authentication"),
-            "manifest control service matches the bootstrap service",
-        );
-    }
-    if manifest.workload_trust.control_service_role != "CONTROL" {
-        note(
-            &mut observations,
-            "workload_trust.control_service_role",
-            &manifest.workload_trust.control_service_role,
-            "manifest",
-            claimed_at,
-            revision,
-            None,
-            ObservationResult::Mismatch,
-            None,
-            "control service role is not CONTROL",
-        );
-        let _ = error.get_or_insert(IdentityError::WrongService);
-    } else if error.is_none() {
-        note(
-            &mut observations,
-            "workload_trust.control_service_role",
-            &manifest.workload_trust.control_service_role,
-            "manifest",
-            claimed_at,
-            revision,
-            None,
-            ObservationResult::Verified,
-            Some("control-role"),
-            "manifest role is CONTROL",
-        );
-    }
-    if error.is_some() {
-        return IdentityEvaluation {
-            observations,
-            binding: Err(error.unwrap()),
-        };
-    }
-
-    if manifest.workload_trust.trust_domain != bootstrap.provider_domain {
-        note(
-            &mut observations,
-            "workload_trust.trust_domain",
-            &manifest.workload_trust.trust_domain,
-            "local-bootstrap",
-            claimed_at,
-            revision,
-            None,
-            ObservationResult::Mismatch,
-            None,
-            "trust domain does not match the bootstrap provider domain",
-        );
-        error = Some(IdentityError::WrongDomain);
-    } else {
-        note(
-            &mut observations,
-            "workload_trust.trust_domain",
-            &manifest.workload_trust.trust_domain,
-            "local-bootstrap",
-            claimed_at,
-            revision,
-            None,
-            ObservationResult::Verified,
-            Some("trust-domain"),
-            "trust domain matches the bootstrap provider domain",
-        );
-    }
+    let trust = &manifest.workload_trust;
+    let domain = bootstrap.provider_domain.as_str();
+    let service_prefix = format!("spiffe://{domain}/");
     let website_host = uri_host(&manifest.platform.website);
-    if website_host.as_deref() != Some(bootstrap.provider_domain.as_str()) {
-        note(
-            &mut observations,
-            "platform.website",
-            &manifest.platform.website,
-            "local-bootstrap",
-            claimed_at,
-            revision,
-            None,
-            ObservationResult::Mismatch,
-            None,
-            "website host does not match the bootstrap provider domain",
-        );
-        let _ = error.get_or_insert(IdentityError::WrongDomain);
-    } else if error.is_none() {
-        note(
-            &mut observations,
-            "platform.website",
-            &manifest.platform.website,
-            "local-bootstrap",
-            claimed_at,
-            revision,
-            None,
-            ObservationResult::Verified,
-            Some("domain-authority"),
-            "website host matches the bootstrap provider domain",
-        );
-    }
-    if error.is_some() {
-        return IdentityEvaluation {
-            observations,
-            binding: Err(error.unwrap()),
-        };
-    }
-
-    if manifest.federation.control_endpoint != bootstrap.expected_control_endpoint {
-        note(
-            &mut observations,
-            "federation.control_endpoint",
-            &manifest.federation.control_endpoint,
-            "local-bootstrap",
-            claimed_at,
-            revision,
-            None,
-            ObservationResult::Mismatch,
-            None,
-            "control endpoint does not match the bootstrap endpoint",
-        );
-        error = Some(IdentityError::WrongEndpoint);
-    } else {
-        note(
-            &mut observations,
-            "federation.control_endpoint",
-            &manifest.federation.control_endpoint,
-            "local-bootstrap",
-            claimed_at,
-            revision,
-            None,
-            ObservationResult::Verified,
-            Some("control-endpoint"),
-            "control endpoint matches the bootstrap endpoint",
-        );
-    }
-    let protocols = manifest.federation.control_protocols.iter().cloned().collect::<Vec<_>>().join(",");
-    if !manifest.federation.control_protocols.iter().any(|value| value == "federation-peer/v1")
-        || !manifest.federation.control_protocols.iter().any(|value| value == "federation-control/v1")
-    {
-        note(
-            &mut observations,
-            "federation.control_protocols",
-            &protocols,
-            "manifest",
-            claimed_at,
-            revision,
-            None,
-            ObservationResult::Mismatch,
-            None,
-            "control protocols do not include the peer and relationship schemas",
-        );
-        let _ = error.get_or_insert(IdentityError::WrongEndpoint);
-    } else if error.is_none() {
-        note(
-            &mut observations,
-            "federation.control_protocols",
-            &protocols,
-            "manifest",
-            claimed_at,
-            revision,
-            None,
-            ObservationResult::Verified,
-            Some("schema-compatibility"),
-            "peer and relationship control schemas are present",
-        );
-    }
-    let leases = manifest.federation.relationship_lease_profiles.iter().cloned().collect::<Vec<_>>().join(",");
-    if !manifest.federation.relationship_lease_profiles.iter().any(|value| value == "FRL/1") {
-        note(
-            &mut observations,
-            "federation.relationship_lease_profiles",
-            &leases,
-            "manifest",
-            claimed_at,
-            revision,
-            None,
-            ObservationResult::Mismatch,
-            None,
-            "FRL/1 is not an offered lease profile",
-        );
-        let _ = error.get_or_insert(IdentityError::WrongEndpoint);
-    } else if error.is_none() {
-        note(
-            &mut observations,
-            "federation.relationship_lease_profiles",
-            &leases,
-            "manifest",
-            claimed_at,
-            revision,
-            None,
-            ObservationResult::Verified,
-            Some("schema-compatibility"),
-            "FRL/1 is an offered lease profile",
-        );
-    }
-    if error.is_some() {
-        return IdentityEvaluation {
-            observations,
-            binding: Err(error.unwrap()),
-        };
-    }
-
-    if manifest.discovery.directory_endpoint != bootstrap.expected_directory_endpoint {
-        note(
-            &mut observations,
-            "discovery.directory_endpoint",
-            &manifest.discovery.directory_endpoint,
-            "local-bootstrap",
-            claimed_at,
-            revision,
-            None,
-            ObservationResult::Mismatch,
-            None,
-            "directory endpoint does not match the bootstrap endpoint",
-        );
-        error = Some(IdentityError::WrongDirectory);
-    } else {
-        note(
-            &mut observations,
-            "discovery.directory_endpoint",
-            &manifest.discovery.directory_endpoint,
-            "local-bootstrap",
-            claimed_at,
-            revision,
-            None,
-            ObservationResult::Verified,
-            Some("directory-endpoint"),
-            "directory endpoint matches the bootstrap endpoint",
-        );
-    }
-    if evidence.source_directory_service_id != bootstrap.expected_local_directory_service_id {
-        note(
-            &mut observations,
-            "directory_name.source_directory_service_id",
-            &evidence.source_directory_service_id,
-            "directory-name-evidence",
-            &evidence.verified_at,
-            revision,
-            None,
-            ObservationResult::Mismatch,
-            None,
-            "Directory evidence did not come from the bootstrap Directory service",
-        );
-        let _ = error.get_or_insert(IdentityError::WrongDirectory);
-    } else if error.is_none() {
-        note(
-            &mut observations,
-            "directory_name.source_directory_service_id",
-            &evidence.source_directory_service_id,
-            "directory-name-evidence",
-            &evidence.verified_at,
-            revision,
-            None,
-            ObservationResult::Verified,
-            Some("directory-service"),
-            "Directory evidence came from the bootstrap Directory service",
-        );
-    }
-    if error.is_some() {
-        return IdentityEvaluation {
-            observations,
-            binding: Err(error.unwrap()),
-        };
-    }
-
-    if manifest.workload_trust.bundle_endpoint != bootstrap.expected_bundle_endpoint {
-        note(
-            &mut observations,
-            "workload_trust.bundle_endpoint",
-            &manifest.workload_trust.bundle_endpoint,
-            "local-bootstrap",
-            claimed_at,
-            revision,
-            None,
-            ObservationResult::Mismatch,
-            None,
-            "bundle endpoint does not match the bootstrap endpoint",
-        );
-        error = Some(IdentityError::WrongBundle);
-    } else {
-        note(
-            &mut observations,
-            "workload_trust.bundle_endpoint",
-            &manifest.workload_trust.bundle_endpoint,
-            "local-bootstrap",
-            claimed_at,
-            revision,
-            None,
-            ObservationResult::Verified,
-            Some("bundle-endpoint"),
-            "bundle endpoint matches the bootstrap endpoint",
-        );
-    }
-    if manifest.workload_trust.bundle_profile != bootstrap.expected_bundle_profile {
-        note(
-            &mut observations,
-            "workload_trust.bundle_profile",
-            &manifest.workload_trust.bundle_profile,
-            "local-bootstrap",
-            claimed_at,
-            revision,
-            None,
-            ObservationResult::Mismatch,
-            None,
-            "bundle profile does not match the bootstrap profile",
-        );
-        let _ = error.get_or_insert(IdentityError::WrongBundle);
-    } else if error.is_none() {
-        note(
-            &mut observations,
-            "workload_trust.bundle_profile",
-            &manifest.workload_trust.bundle_profile,
-            "local-bootstrap",
-            claimed_at,
-            revision,
-            None,
-            ObservationResult::Verified,
-            Some("bundle-profile"),
-            "bundle profile matches the bootstrap profile",
-        );
-    }
-    if error.is_some() {
-        return IdentityEvaluation {
-            observations,
-            binding: Err(error.unwrap()),
-        };
-    }
-
-    let name: Uri = match evidence.record_name.parse() {
-        Ok(name) => name,
-        Err(_) => {
-            note(
-                &mut observations,
-                "directory_name.record_name",
-                &evidence.record_name,
-                "directory-name-evidence",
-                &evidence.verified_at,
-                revision,
-                None,
-                ObservationResult::Unavailable,
-                None,
-                "Directory record name is not a URI",
-            );
-            return IdentityEvaluation {
-                observations,
-                binding: Err(IdentityError::WrongRecord),
-            };
+    let negotiated = negotiate_protocols(local_protocols, &manifest.federation.protocols);
+    let protocols = manifest.federation.protocols.join(",");
+    let document = parse_domain_document(&evidence.body);
+    let expected_url = well_known_url(domain, profile);
+    let ca_root = manifest.agent_trust.ca_root.as_str();
+    let checks = [
+        Check { field: "platform.platform_id", observed: manifest.platform.platform_id.as_str(),
+            matches: manifest.platform.platform_id == bootstrap.peer, source: "local-bootstrap",
+            property: "platform-binding", error: IdentityError::WrongPeer,
+            reason: "manifest platform id against the bootstrap peer" },
+        Check { field: "authenticated_control_service", observed: observed_control_service_id,
+            matches: observed_control_service_id == bootstrap.expected_control_service_id
+                && observed_control_service_id.starts_with(&service_prefix),
+            source: "authenticated-service", property: "exact-service-authentication",
+            error: IdentityError::WrongService,
+            reason: "authenticated SPIFFE ID against the bootstrap control service in its domain" },
+        Check { field: "workload_trust.control_service_identity", observed: &trust.control_service_identity,
+            matches: trust.control_service_identity == bootstrap.expected_control_service_id,
+            source: "local-bootstrap", property: "exact-service-authentication",
+            error: IdentityError::WrongService, reason: "manifest control service against the bootstrap" },
+        Check { field: "workload_trust.control_service_role", observed: &trust.control_service_role,
+            matches: trust.control_service_role == "CONTROL", source: "manifest", property: "control-role",
+            error: IdentityError::WrongService, reason: "control service role must be CONTROL" },
+        Check { field: "workload_trust.edge_service_identity", observed: &trust.edge_service_identity,
+            matches: trust.edge_service_identity == bootstrap.expected_edge_service_id
+                && trust.edge_service_identity.starts_with(&service_prefix),
+            source: "local-bootstrap", property: "edge-service",
+            error: IdentityError::WrongService, reason: "manifest edge service against the bootstrap in its domain" },
+        Check { field: "workload_trust.edge_service_role", observed: &trust.edge_service_role,
+            matches: trust.edge_service_role == "EDGE", source: "manifest", property: "edge-role",
+            error: IdentityError::WrongService, reason: "edge service role must be EDGE" },
+        Check { field: "platform.provider_domain", observed: &manifest.platform.provider_domain,
+            matches: valid_provider_domain(domain) && manifest.platform.provider_domain == domain,
+            source: "local-bootstrap", property: "provider-domain",
+            error: IdentityError::WrongDomain, reason: "provider domain against the bootstrap" },
+        Check { field: "workload_trust.trust_domain", observed: &trust.trust_domain,
+            matches: trust.trust_domain == domain, source: "local-bootstrap", property: "trust-domain",
+            error: IdentityError::WrongDomain, reason: "SPIFFE trust domain against the provider domain" },
+        Check { field: "platform.website", observed: &manifest.platform.website,
+            matches: website_host.as_deref() == Some(domain), source: "local-bootstrap",
+            property: "domain-authority", error: IdentityError::WrongDomain,
+            reason: "website host against the provider domain" },
+        Check { field: "federation.control_endpoint", observed: &manifest.federation.control_endpoint,
+            matches: manifest.federation.control_endpoint == bootstrap.expected_control_endpoint,
+            source: "local-bootstrap", property: "control-endpoint",
+            error: IdentityError::WrongEndpoint, reason: "control endpoint against the bootstrap" },
+        Check { field: "federation.edge_endpoint", observed: &manifest.federation.edge_endpoint,
+            matches: manifest.federation.edge_endpoint == bootstrap.expected_edge_endpoint,
+            source: "local-bootstrap", property: "edge-endpoint",
+            error: IdentityError::WrongEndpoint, reason: "edge endpoint against the bootstrap" },
+        Check { field: "federation.protocols", observed: &protocols, matches: negotiated.is_ok(),
+            source: "manifest", property: "protocol-negotiation", error: IdentityError::UnsupportedProtocol,
+            reason: "a common version for every local protocol family" },
+        Check { field: "workload_trust.bundle_endpoint", observed: &trust.bundle_endpoint,
+            matches: trust.bundle_endpoint == bootstrap.expected_bundle_endpoint,
+            source: "local-bootstrap", property: "bundle-endpoint",
+            error: IdentityError::WrongBundle, reason: "bundle endpoint against the bootstrap" },
+        Check { field: "workload_trust.bundle_profile", observed: &trust.bundle_profile,
+            matches: trust.bundle_profile == bootstrap.expected_bundle_profile,
+            source: "local-bootstrap", property: "bundle-profile",
+            error: IdentityError::WrongBundle, reason: "bundle profile against the bootstrap" },
+        Check { field: "domain_proof.url", observed: &evidence.url, matches: evidence.url == expected_url,
+            source: "domain-proof", property: "domain-proof-location",
+            error: IdentityError::UnsupportedProfile, reason: "well-known URL for the provider domain and profile" },
+        Check { field: "domain_proof.document", observed: &evidence.url,
+            matches: document.as_ref().is_some_and(|d| {
+                d.platform_id == bootstrap.peer
+                    && d.control_service_identity == bootstrap.expected_control_service_id
+                    && d.edge_service_identity == bootstrap.expected_edge_service_id
+                    && d.agent_ca_root == ca_root
+            }),
+            source: "domain-proof", property: "domain-control",
+            error: IdentityError::WrongDomainDocument,
+            reason: "domain document names this platform, both services and the manifest CA root" },
+    ];
+    for check in checks {
+        if !check.matches {
+            note(&mut observations, revision, check.field, check.observed, check.source, claimed_at, None,
+                ObservationResult::Mismatch, None, check.reason);
+            return IdentityEvaluation { observations, binding: Err(check.error) };
         }
-    };
-    let Some(scheme) = name.scheme_str() else {
-        note(
-            &mut observations,
-            "directory_name.record_name",
-            &evidence.record_name,
-            "directory-name-evidence",
-            &evidence.verified_at,
-            revision,
-            None,
-            ObservationResult::Unavailable,
-            None,
-            "Directory record name has no URI scheme",
-        );
-        return IdentityEvaluation {
-            observations,
-            binding: Err(IdentityError::WrongRecord),
-        };
-    };
-    if !matches!(
-        (profile, scheme),
-        (EvidenceProfile::ProductionHttps, "https") | (EvidenceProfile::LocalHttpTest, "http")
-    ) {
-        note(
-            &mut observations,
-            "directory_name.record_name",
-            &evidence.record_name,
-            "directory-name-evidence",
-            &evidence.verified_at,
-            revision,
-            None,
-            ObservationResult::Mismatch,
-            None,
-            "record name scheme does not match the selected evidence profile",
-        );
-        return IdentityEvaluation {
-            observations,
-            binding: Err(IdentityError::UnsupportedProfile),
-        };
+        note(&mut observations, revision, check.field, check.observed, check.source, claimed_at, None,
+            ObservationResult::Verified, Some(check.property), check.reason);
     }
-    let Some(authority) = name.authority() else {
-        note(
-            &mut observations,
-            "directory_name.record_name",
-            &evidence.record_name,
-            "directory-name-evidence",
-            &evidence.verified_at,
-            revision,
-            None,
-            ObservationResult::Unavailable,
-            None,
-            "Directory record name has no authority",
-        );
-        return IdentityEvaluation {
-            observations,
-            binding: Err(IdentityError::WrongRecord),
-        };
-    };
-    if authority.host() != bootstrap.provider_domain
-        || evidence.domain != authority.as_str()
-        || manifest.discovery.domain_proof_ref.as_deref() != Some(evidence.record_name.as_str())
-        || manifest.discovery.publisher_name_ref.as_deref() != Some(evidence.record_name.as_str())
-        || !manifest.discovery.record_cids.contains(&evidence.record_cid)
-    {
-        note(
-            &mut observations,
-            "discovery.domain_proof_ref",
-            manifest.discovery.domain_proof_ref.as_deref().unwrap_or(""),
-            "directory-name-evidence",
-            &evidence.verified_at,
-            revision,
-            None,
-            ObservationResult::Mismatch,
-            None,
-            "Directory name evidence does not match the manifest domain proof, publisher, or selected CID",
-        );
-        return IdentityEvaluation {
-            observations,
-            binding: Err(IdentityError::WrongRecord),
-        };
-    }
-    note(
-        &mut observations,
-        "discovery.domain_proof_ref",
-        evidence.record_name.as_str(),
-        "directory-name-evidence",
-        &evidence.verified_at,
-        revision,
-        None,
-        ObservationResult::Verified,
-        Some("selected-record"),
-        "Directory name matches the manifest domain proof and selected CID",
-    );
-    if !evidence.verified || evidence.method != "wellknown" || evidence.key_id.is_empty() {
-        note(
-            &mut observations,
-            "directory_name.key_id",
-            &evidence.key_id,
-            "directory-name-evidence",
-            &evidence.verified_at,
-            revision,
-            None,
-            ObservationResult::Mismatch,
-            None,
-            "Directory name is not a verified well-known domain key",
-        );
-        return IdentityEvaluation {
-            observations,
-            binding: Err(IdentityError::UnverifiedName),
-        };
-    }
-    note(
-        &mut observations,
-        "directory_name.key_id",
-        &evidence.key_id,
-        "directory-name-evidence",
-        &evidence.verified_at,
-        revision,
-        None,
-        ObservationResult::Verified,
-        Some("domain-key-control"),
-        "Directory well-known check verified the publisher domain key",
-    );
 
-    let parsed_verified_at = utc_timestamp(&evidence.verified_at).ok().map(unix_seconds);
-    let freshness = parsed_verified_at.map(|verified_at| now_unix_seconds.saturating_sub(verified_at));
-    let fresh = match parsed_verified_at {
-        Some(verified_at) => {
-            bootstrap.max_evidence_age_seconds > 0
-                && bootstrap.max_evidence_age_seconds <= 604800
-                && verified_at <= now_unix_seconds + 300
-                && now_unix_seconds.saturating_sub(verified_at) <= bootstrap.max_evidence_age_seconds
-        }
-        None => false,
-    };
+    let fetched = parse_utc(&evidence.fetched_at).map(|t| t.unix_seconds());
+    let freshness = fetched.map(|at| now_unix_seconds.saturating_sub(at));
+    let fresh = fetched.is_some_and(|at| {
+        bootstrap.max_evidence_age_seconds > 0
+            && bootstrap.max_evidence_age_seconds <= MAX_EVIDENCE_AGE_SECONDS
+            && at <= now_unix_seconds + MAX_CLOCK_SKEW_SECONDS as i64
+            && now_unix_seconds.saturating_sub(at) <= bootstrap.max_evidence_age_seconds
+    });
     if !fresh {
-        note(
-            &mut observations,
-            "directory_name.verified_at",
-            &evidence.verified_at,
-            "directory-name-evidence",
-            &evidence.verified_at,
-            revision,
-            freshness,
-            ObservationResult::Mismatch,
-            None,
-            "Directory evidence is missing, skewed, or older than the bootstrap freshness limit",
-        );
-        return IdentityEvaluation {
-            observations,
-            binding: Err(IdentityError::StaleOrInvalidEvidence),
-        };
+        note(&mut observations, revision, "domain_proof.fetched_at", &evidence.fetched_at, "domain-proof", &evidence.fetched_at,
+            freshness, ObservationResult::Mismatch, None,
+            "domain proof is missing, skewed, or older than the bootstrap freshness limit");
+        return IdentityEvaluation { observations, binding: Err(IdentityError::StaleOrInvalidEvidence) };
     }
-    note(
-        &mut observations,
-        "directory_name.verified_at",
-        &evidence.verified_at,
-        "directory-name-evidence",
-        &evidence.verified_at,
-        revision,
-        freshness,
-        ObservationResult::Verified,
-        Some("evidence-freshness"),
-        "Directory evidence is inside the bootstrap freshness limit",
-    );
-    let observations_for_binding = observations.clone();
-    IdentityEvaluation {
-        observations,
-        binding: Ok(VerifiedProviderBinding {
-            peer: bootstrap.peer.clone(),
-            manifest_revision: manifest.revision,
-            manifest_digest: snapshot.digest,
-            observed_control_service_id: observed_control_service_id.to_owned(),
-            verified_domain: bootstrap.provider_domain.clone(),
-            record_cid: evidence.record_cid.clone(),
-            key_id: evidence.key_id.clone(),
-            source_directory_service_id: evidence.source_directory_service_id.clone(),
-            verified_at: evidence.verified_at.clone(),
-            profile,
-            bootstrap_digest: bootstrap.digest(),
-            observations: observations_for_binding,
-        }),
-    }
+    note(&mut observations, revision, "domain_proof.fetched_at", &evidence.fetched_at, "domain-proof", &evidence.fetched_at,
+        freshness, ObservationResult::Verified, Some("evidence-freshness"),
+        "domain proof is inside the bootstrap freshness limit");
+
+    let binding = VerifiedProviderBinding {
+        peer: bootstrap.peer.clone(),
+        manifest_revision: revision,
+        manifest_digest: snapshot.digest,
+        observed_control_service_id: observed_control_service_id.to_owned(),
+        verified_domain: domain.to_owned(),
+        edge_service_id: trust.edge_service_identity.clone(),
+        edge_endpoint: manifest.federation.edge_endpoint.clone(),
+        agent_ca_root: ca_root.to_owned(),
+        negotiated_protocols: negotiated
+            .expect("negotiation checked above")
+            .into_iter()
+            .map(str::to_owned)
+            .collect(),
+        domain_document_digest: sha256(&evidence.body),
+        verified_at: evidence.fetched_at.clone(),
+        profile,
+        bootstrap_digest: bootstrap.digest(),
+        observations: observations.clone(),
+    };
+    IdentityEvaluation { observations, binding: Ok(binding) }
 }
 
+#[allow(clippy::too_many_arguments)]
 fn note(
     observations: &mut Vec<FieldObservation>,
-    field_path: &str,
-    observed_value: &str,
+    revision: u64,
+    field: &str,
+    value: &str,
     source: &str,
-    observed_at: &str,
-    evidence_revision: u64,
-    freshness_seconds: Option<i64>,
+    at: &str,
+    freshness: Option<i64>,
     result: ObservationResult,
-    verified_property: Option<&str>,
+    property: Option<&str>,
     reason: &str,
 ) {
     observations.push(FieldObservation {
-        field_path: field_path.to_owned(),
-        observed_value: observed_value.to_owned(),
+        field_path: field.to_owned(),
+        observed_value: value.to_owned(),
         source: source.to_owned(),
-        observed_at: observed_at.to_owned(),
-        evidence_revision,
-        freshness_seconds,
+        observed_at: at.to_owned(),
+        evidence_revision: revision,
+        freshness_seconds: freshness,
         result,
-        verified_property: (result == ObservationResult::Verified).then(|| {
-            verified_property
-                .expect("verified observation names its property")
-                .to_owned()
-        }),
+        verified_property: (result == ObservationResult::Verified)
+            .then(|| property.expect("verified observation names its property").to_owned()),
         reason: reason.to_owned(),
     });
 }
@@ -879,337 +402,158 @@ fn uri_host(value: &str) -> Option<String> {
         .map(|a| a.host().to_owned())
 }
 
-fn unix_seconds(value: crate::provider_manifest::UtcInstant) -> i64 {
-    let mut year = i64::from(value.0);
-    let month = i64::from(value.1);
-    let day = i64::from(value.2);
-    if month <= 2 {
-        year -= 1;
-    }
-    let era = year.div_euclid(400);
-    let year_of_era = year - era * 400;
-    let adjusted_month = month + if month > 2 { -3 } else { 9 };
-    let day_of_year = (153 * adjusted_month + 2) / 5 + day - 1;
-    let year_of_era_day = year_of_era * 365 + year_of_era / 4 - year_of_era / 100 + day_of_year;
-    let days = era * 146097 + year_of_era_day - 719468;
-    days * 86400 + i64::from(value.3) * 3600 + i64::from(value.4) * 60 + i64::from(value.5)
-}
-
-pub fn utc_unix_seconds(value: &str) -> Option<i64> {
-    Some(unix_seconds(utc_timestamp(value).ok()?))
-}
-
-/// A private target address must lie beneath the independently provisioned
-/// provider domain. Exact-address ownership is still resolved only by that
-/// provider's own host after authenticated delivery.
-pub fn target_address_in_provider_domain(address: &str, domain: &str) -> bool {
-    fn valid_dns(value: &str) -> bool {
-        !value.is_empty()
-            && value.len() <= 253
-            && value.is_ascii()
-            && value
-                .bytes()
-                .all(|b| b.is_ascii_lowercase() || b.is_ascii_digit() || b == b'-' || b == b'.')
-            && value.split('.').all(|label| {
-                !label.is_empty()
-                    && label.len() <= 63
-                    && !label.starts_with('-')
-                    && !label.ends_with('-')
-            })
-    }
-    valid_dns(address)
-        && valid_dns(domain)
-        && address
-            .strip_suffix(domain)
-            .is_some_and(|prefix| prefix.ends_with('.') && prefix.len() > 1)
-}
-
-/// Private provider-scoped short address. Issuers start with 16 base32
-/// characters; accepting up to 32 permits longer keys without a schema
-/// migration. The provider suffix is an authenticated routing hint, not a
-/// public DNS lookup or proof that the target exists.
-pub fn short_address_in_provider_domain(address: &str, domain: &str) -> bool {
-    let Some(label) = address.strip_suffix(domain).and_then(|prefix| prefix.strip_suffix('.')) else {
-        return false;
-    };
-    (16..=32).contains(&label.len())
-        && label.bytes().all(|b| matches!(b, b'0'..=b'9' | b'a'..=b'h' | b'j'..=b'k' | b'm'..=b'n' | b'p'..=b't' | b'v'..=b'z'))
-        && target_address_in_provider_domain(address, domain)
-}
-
-/// Syntax shared by every Base caller before a provider-specific suffix is
-/// checked. The handle has one opaque label; the suffix is a provider domain.
-pub fn valid_private_short_address(address: &str) -> bool {
-    let Some((label, domain)) = address.split_once('.') else { return false; };
-    (16..=32).contains(&label.len())
-        && label.bytes().all(|b| matches!(b, b'0'..=b'9' | b'a'..=b'h' | b'j'..=b'k' | b'm'..=b'n' | b'p'..=b't' | b'v'..=b'z'))
-        && domain.contains('.')
-        && target_address_in_provider_domain(address, domain)
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::provider_manifest::parse_manifest;
+    use crate::provider_manifest::{parse_manifest, tests as manifest};
 
-    #[test]
-    fn provider_scoped_short_handles_allow_length_growth_without_accepting_internal_names() {
-        let domain = "provider-b.test";
-        for width in [16, 17, 18, 32] {
-            let address = format!("{}.{}", "a".repeat(width), domain);
-            assert!(short_address_in_provider_domain(&address, domain));
-        }
-        for invalid in [
-            format!("{}.{}", "a".repeat(15), domain),
-            format!("{}.{}", "a".repeat(33), domain),
-            "calendar.someone.provider-b.test".into(),
-            "iiiiiiiiiiiiiiii.provider-b.test".into(),
-            "aaaaaaaaaaaaaaaa.provider-c.test".into(),
-        ] {
-            assert!(!short_address_in_provider_domain(&invalid, domain));
-        }
-    }
+    const LOCAL: [&str; 4] = crate::SUPPORTED_PROTOCOLS;
+    const CONTROL: &str = "spiffe://provider-b.test/federation/control";
 
-    #[test]
-    fn domain_key_service_and_bootstrap_must_all_match() {
-        let mut manifest = serde_json::json!({
-    "schema": "federation-provider/1",
-    "manifest_id": "provider-a-test-1",
-    "revision": 1,
-    "generated_at": "2026-09-23T08:00:00Z",
-    "platform": {
-        "platform_id": "provider-a",
-        "display_name": "Provider A test fixture",
-        "display_name_source": "LOCAL_METADATA",
-        "operator_name": "Provider A test operator",
-        "website": "https://provider-a.test",
-        "documentation_url": null,
-        "logo_url": null
-    },
-    "discovery": {
-        "ai_catalog_url": "https://catalog.provider-a.test",
-        "host_identifier": null,
-        "host_trust_manifest_ref": null,
-        "directory_endpoint": "https://directory.provider-a.test",
-        "directory_profile": "SPIRE_X509",
-        "publisher_name_ref": null,
-        "record_cids": [],
-        "domain_proof_ref": null
-    },
-    "workload_trust": {
-        "trust_domain": "provider-a.test",
-        "bundle_endpoint": "https://bundle.provider-a.test",
-        "bundle_profile": "https_spiffe",
-        "control_service_identity": "spiffe://provider-a.test/federation/control",
-        "control_service_role": "CONTROL"
-    },
-    "federation": {
-        "control_endpoint": "https://provider-a-bridge:8444/control",
-        "control_protocols": [
-            "federation-peer/v1",
-            "federation-control/v1"
-        ],
-        "relationship_lease_profiles": [
-            "FRL/1"
-        ],
-        "base_capabilities": [
-            "REQUEST_DELIVERY"
-        ]
-    },
-    "application_protocols": [],
-    "transports": [],
-    "source_refs": {
-        "identity_evidence": [],
-        "agent_card": [],
-        "ans": []
-    }
-});
-        let name = "http://provider-a.test:8080/providers/test-1";
-        manifest["discovery"]["domain_proof_ref"] = serde_json::json!(name);
-        manifest["discovery"]["publisher_name_ref"] = serde_json::json!(name);
-        manifest["discovery"]["record_cids"] = serde_json::json!(["bafy-test-cid"]);
-        let snapshot = parse_manifest(&serde_json::to_vec(&manifest).unwrap()).unwrap();
-        let bootstrap = BootstrapAuthority {
-            peer: PlatformId::new("provider-a").unwrap(),
-            provider_domain: "provider-a.test".into(),
-            expected_control_service_id: "spiffe://provider-a.test/federation/control".into(),
-            expected_control_endpoint: "https://provider-a-bridge:8444/control".into(),
-            expected_directory_endpoint: "https://directory.provider-a.test".into(),
-            expected_local_directory_service_id: "spiffe://provider-b.test/directory/server".into(),
-            expected_bundle_endpoint: "https://bundle.provider-a.test".into(),
+    fn bootstrap() -> BootstrapAuthority {
+        BootstrapAuthority {
+            peer: PlatformId::new("provider-b").unwrap(),
+            provider_domain: "provider-b.test".into(),
+            expected_control_service_id: CONTROL.into(),
+            expected_control_endpoint: "https://control.provider-b.test/control".into(),
+            expected_edge_service_id: "spiffe://provider-b.test/federation/edge".into(),
+            expected_edge_endpoint: "edge.provider-b.test:8443".into(),
+            expected_bundle_endpoint: "https://bundle.provider-b.test".into(),
             expected_bundle_profile: "https_spiffe".into(),
-            max_evidence_age_seconds: 7200,
-        };
-        let evidence = DirectoryNameEvidence {
-            record_cid: "bafy-test-cid".into(),
-            record_name: name.into(),
-            verified: true,
-            domain: "provider-a.test:8080".into(),
-            method: "wellknown".into(),
-            key_id: "test-key".into(),
-            verified_at: "2026-09-23T08:00:00Z".into(),
-            source_directory_service_id: "spiffe://provider-b.test/directory/server".into(),
-        };
-        let now = unix_seconds(utc_timestamp("2026-09-23T09:00:00Z").unwrap());
-        assert_eq!(
-            unix_seconds(utc_timestamp("1970-01-01T00:00:00Z").unwrap()),
-            0
-        );
-        let binding = verify_provider_binding(
-            &snapshot,
-            &bootstrap,
-            &bootstrap.expected_control_service_id,
-            &evidence,
-            EvidenceProfile::LocalHttpTest,
-            now,
-        )
-        .unwrap();
-        assert_eq!(binding.manifest_digest(), snapshot.digest);
-        assert!(binding.observations().iter().any(|observation| {
-            observation.field_path == "platform.operator_name"
-                && observation.result == ObservationResult::SelfDeclared
-        }));
-        assert!(binding.observations().iter().any(|observation| {
-            observation.verified_property.as_deref() == Some("domain-key-control")
-                && observation.result == ObservationResult::Verified
-        }));
-        assert!(binding.observations().iter().any(|observation| {
-            observation.verified_property.as_deref() == Some("evidence-freshness")
-                && observation.result == ObservationResult::Verified
-                && observation.freshness_seconds.is_some()
-        }));
-        assert!(binding.observations().iter().all(|observation| {
-            observation.result != ObservationResult::Verified || observation.verified_property.is_some()
-        }));
-        let rejected = evaluate_provider_identity(
-            &snapshot,
-            &bootstrap,
-            "spiffe://provider-a.test/other",
-            &evidence,
-            EvidenceProfile::LocalHttpTest,
-            now,
-        );
-        assert_eq!(rejected.binding, Err(IdentityError::WrongService));
-        assert!(rejected.observations.iter().any(|observation| {
-            observation.field_path == "authenticated_control_service"
-                && observation.result == ObservationResult::Mismatch
-        }));
-        assert!(rejected.observations.iter().all(|observation| {
-            observation.verified_property.as_deref() != Some("domain-key-control")
-        }));
-        assert_eq!(
-            verify_provider_binding(
-                &snapshot,
-                &bootstrap,
-                &bootstrap.expected_control_service_id,
-                &evidence,
-                EvidenceProfile::ProductionHttps,
-                now
-            ),
-            Err(IdentityError::UnsupportedProfile)
-        );
-        let mut wrong = evidence.clone();
-        wrong.verified = false;
-        assert_eq!(
-            verify_provider_binding(
-                &snapshot,
-                &bootstrap,
-                &bootstrap.expected_control_service_id,
-                &wrong,
-                EvidenceProfile::LocalHttpTest,
-                now
-            ),
-            Err(IdentityError::UnverifiedName)
-        );
-        wrong = evidence.clone();
-        wrong.key_id = "".into();
-        assert_eq!(
-            verify_provider_binding(
-                &snapshot,
-                &bootstrap,
-                &bootstrap.expected_control_service_id,
-                &wrong,
-                EvidenceProfile::LocalHttpTest,
-                now
-            ),
-            Err(IdentityError::UnverifiedName)
-        );
-        assert_eq!(
-            verify_provider_binding(
-                &snapshot,
-                &bootstrap,
-                &bootstrap.expected_control_service_id,
-                &evidence,
-                EvidenceProfile::LocalHttpTest,
-                now + 7201
-            ),
-            Err(IdentityError::StaleOrInvalidEvidence)
-        );
-        assert_eq!(
-            verify_provider_binding(
-                &snapshot,
-                &bootstrap,
-                "spiffe://provider-a.test/other",
-                &evidence,
-                EvidenceProfile::LocalHttpTest,
-                now
-            ),
-            Err(IdentityError::WrongService)
-        );
-        manifest["workload_trust"]["control_service_role"] = serde_json::json!("DIRECTORY");
-        let wrong_role = parse_manifest(&serde_json::to_vec(&manifest).unwrap()).unwrap();
-        let role_rejected = evaluate_provider_identity(
-            &wrong_role,
-            &bootstrap,
-            &bootstrap.expected_control_service_id,
-            &evidence,
-            EvidenceProfile::LocalHttpTest,
-            now,
-        );
-        assert_eq!(role_rejected.binding, Err(IdentityError::WrongService));
-        assert!(role_rejected.observations.iter().any(|observation| {
-            observation.field_path == "workload_trust.control_service_role"
-                && observation.result == ObservationResult::Mismatch
-        }));
-        assert!(role_rejected.observations.iter().all(|observation| {
-            observation.verified_property.as_deref() != Some("domain-key-control")
-        }));
-        manifest["workload_trust"]["control_service_role"] = serde_json::json!("CONTROL");
-        manifest["workload_trust"]["trust_domain"] = serde_json::json!("other.test");
-        let wrong_domain = parse_manifest(&serde_json::to_vec(&manifest).unwrap()).unwrap();
-        let domain_rejected = evaluate_provider_identity(
-            &wrong_domain,
-            &bootstrap,
-            &bootstrap.expected_control_service_id,
-            &evidence,
-            EvidenceProfile::LocalHttpTest,
-            now,
-        );
-        assert_eq!(domain_rejected.binding, Err(IdentityError::WrongDomain));
-        assert!(domain_rejected.observations.iter().any(|observation| {
-            observation.field_path == "workload_trust.trust_domain"
-                && observation.result == ObservationResult::Mismatch
-        }));
+            max_evidence_age_seconds: 3600,
+        }
+    }
+
+    fn document() -> serde_json::Value {
+        serde_json::json!({
+            "schema": DOMAIN_DOCUMENT_SCHEMA,
+            "platform_id": "provider-b",
+            "control_service_identity": CONTROL,
+            "edge_service_identity": "spiffe://provider-b.test/federation/edge",
+            "agent_ca_root": manifest::test_ca_root(),
+        })
+    }
+
+    fn evidence(body: &serde_json::Value) -> DomainProofEvidence {
+        DomainProofEvidence {
+            url: "https://provider-b.test/.well-known/ptpan-provider.json".into(),
+            fetched_at: "2026-09-21T13:33:20Z".into(),
+            body: serde_json::to_vec(body).unwrap(),
+        }
+    }
+
+    fn evaluate(
+        change: impl FnOnce(&mut crate::provider_manifest::ProviderManifest),
+        boot: BootstrapAuthority,
+        proof: DomainProofEvidence,
+        service: &str,
+    ) -> IdentityEvaluation {
+        let mut m = manifest::valid();
+        change(&mut m);
+        let snapshot = parse_manifest(&serde_json::to_vec(&m).unwrap()).unwrap();
+        let now = crate::time::utc_unix_seconds("2026-09-21T13:40:00Z").unwrap();
+        evaluate_provider_identity(&snapshot, &boot, service, &proof, EvidenceProfile::ProductionHttps, &LOCAL, now)
     }
 
     #[test]
-    fn private_address_must_be_a_dns_child_of_the_selected_provider() {
-        assert!(target_address_in_provider_domain(
-            "agent.agents.provider-b.test",
-            "provider-b.test"
-        ));
-        for address in [
-            "provider-b.test",
-            "agent.provider-b.test.evil",
-            "agent.provider-c.test",
-            "AGENT.provider-b.test",
-            "agent..provider-b.test",
-            "-bad.provider-b.test",
-        ] {
-            assert!(
-                !target_address_in_provider_domain(address, "provider-b.test"),
-                "{address}"
-            );
+    fn matching_manifest_bootstrap_service_and_domain_document_verify() {
+        let result = evaluate(|_| {}, bootstrap(), evidence(&document()), CONTROL);
+        let binding = result.binding.unwrap();
+        assert_eq!(binding.verified_domain(), "provider-b.test");
+        assert_eq!(binding.edge_endpoint(), "edge.provider-b.test:8443");
+        assert_eq!(binding.negotiated_protocols().len(), 4);
+        assert!(result
+            .observations
+            .iter()
+            .filter(|o| o.result == ObservationResult::Verified)
+            .all(|o| o.verified_property.is_some()));
+        assert!(result.observations.iter().any(|o| o.field_path == "domain_proof.document"
+            && o.result == ObservationResult::Verified));
+    }
+
+    #[test]
+    fn each_field_mismatch_rejects_without_verifying_later_fields() {
+        type Case = (fn(&mut crate::provider_manifest::ProviderManifest), IdentityError, &'static str);
+        let cases: [Case; 8] = [
+            (|m| m.platform.platform_id = PlatformId::new("provider-c").unwrap(), IdentityError::WrongPeer, "platform.platform_id"),
+            (|m| m.workload_trust.control_service_role = "EDGE".into(), IdentityError::WrongService, "workload_trust.control_service_role"),
+            (|m| m.workload_trust.edge_service_identity = "spiffe://provider-c.test/federation/edge".into(), IdentityError::WrongService, "workload_trust.edge_service_identity"),
+            (|m| m.workload_trust.trust_domain = "provider-c.test".into(), IdentityError::WrongDomain, "workload_trust.trust_domain"),
+            (|m| m.platform.website = "https://provider-c.test".into(), IdentityError::WrongDomain, "platform.website"),
+            (|m| m.federation.edge_endpoint = "edge.provider-b.test:9443".into(), IdentityError::WrongEndpoint, "federation.edge_endpoint"),
+            (|m| m.federation.protocols = vec!["federation-control/v3".into(), "FRL/1".into()], IdentityError::UnsupportedProtocol, "federation.protocols"),
+            (|m| m.workload_trust.bundle_profile = "https_web".into(), IdentityError::WrongBundle, "workload_trust.bundle_profile"),
+        ];
+        for (change, error, field) in cases {
+            let result = evaluate(change, bootstrap(), evidence(&document()), CONTROL);
+            assert_eq!(result.binding.err(), Some(error), "{field}");
+            let last = result.observations.last().unwrap();
+            assert_eq!((last.field_path.as_str(), last.result), (field, ObservationResult::Mismatch));
+            assert!(!result.observations.iter().any(|o| o.field_path == "domain_proof.document"));
         }
+    }
+
+    #[test]
+    fn wrong_service_on_the_connection_rejects() {
+        let result = evaluate(|_| {}, bootstrap(), evidence(&document()), "spiffe://provider-b.test/other");
+        assert_eq!(result.binding.err(), Some(IdentityError::WrongService));
+    }
+
+    #[test]
+    fn domain_document_must_name_this_platform_services_and_ca_root() {
+        for (key, value) in [
+            ("platform_id", "provider-c"),
+            ("control_service_identity", "spiffe://provider-b.test/x"),
+            ("edge_service_identity", "spiffe://provider-b.test/y"),
+        ] {
+            let mut doc = document();
+            doc[key] = value.into();
+            let result = evaluate(|_| {}, bootstrap(), evidence(&doc), CONTROL);
+            assert_eq!(result.binding.err(), Some(IdentityError::WrongDomainDocument), "{key}");
+        }
+        let mut other_root = document();
+        let mut der = vec![0x30, 0x82, 0x01, 0x00];
+        der.resize(260, 0x11);
+        other_root["agent_ca_root"] = base64::Engine::encode(&base64::engine::general_purpose::STANDARD, der).into();
+        assert_eq!(evaluate(|_| {}, bootstrap(), evidence(&other_root), CONTROL).binding.err(), Some(IdentityError::WrongDomainDocument));
+        let mut extra = document();
+        extra["peers"] = serde_json::json!(["provider-a"]);
+        assert_eq!(evaluate(|_| {}, bootstrap(), evidence(&extra), CONTROL).binding.err(), Some(IdentityError::WrongDomainDocument));
+    }
+
+    #[test]
+    fn proof_location_profile_and_freshness_are_enforced() {
+        let mut http = evidence(&document());
+        http.url = "http://provider-b.test/.well-known/ptpan-provider.json".into();
+        assert_eq!(evaluate(|_| {}, bootstrap(), http, CONTROL).binding.err(), Some(IdentityError::UnsupportedProfile));
+        let mut other_host = evidence(&document());
+        other_host.url = "https://provider-c.test/.well-known/ptpan-provider.json".into();
+        assert_eq!(evaluate(|_| {}, bootstrap(), other_host, CONTROL).binding.err(), Some(IdentityError::UnsupportedProfile));
+        let mut stale = evidence(&document());
+        stale.fetched_at = "2026-09-21T11:00:00Z".into();
+        assert_eq!(evaluate(|_| {}, bootstrap(), stale, CONTROL).binding.err(), Some(IdentityError::StaleOrInvalidEvidence));
+        let mut future = evidence(&document());
+        future.fetched_at = "2026-09-21T13:40:06Z".into();
+        assert_eq!(evaluate(|_| {}, bootstrap(), future, CONTROL).binding.err(), Some(IdentityError::StaleOrInvalidEvidence));
+        let mut skewed = evidence(&document());
+        skewed.fetched_at = "2026-09-21T13:40:05Z".into();
+        assert!(evaluate(|_| {}, bootstrap(), skewed, CONTROL).binding.is_ok());
+    }
+
+    #[test]
+    fn checked_in_domain_schema_matches_the_document() {
+        let schema: serde_json::Value =
+            serde_json::from_str(include_str!("../../../schemas/provider-domain-v1.json")).unwrap();
+        assert_eq!(schema["$id"], DOMAIN_DOCUMENT_SCHEMA);
+        let parsed = parse_domain_document(&serde_json::to_vec(&document()).unwrap()).unwrap();
+        crate::schema_check::matches(&schema, &schema, &serde_json::to_value(parsed).unwrap(), "domain");
+    }
+
+    #[test]
+    fn local_test_profile_uses_http_only_for_its_own_location() {
+        assert_eq!(
+            well_known_url("provider-b.test", EvidenceProfile::LocalHttpTest),
+            "http://provider-b.test/.well-known/ptpan-provider.json"
+        );
     }
 }

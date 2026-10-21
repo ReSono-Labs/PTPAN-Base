@@ -3,8 +3,8 @@
 //! a durable `AUTHORIZED` hint, or an unblock never creates consent.
 
 use crate::control_event::{
-    ActorSide, ConfigAckPayload, RelationshipState, RevokePayload, SourceAuthorization,
-    SourceAuthorizationPayload, StatusPayload,
+    ActorSide, ConfigAckPayload, PairBlockState, RelationshipState, RevokePayload,
+    SourceAuthorization, SourceAuthorizationPayload, StatusPayload,
 };
 use crate::{LeaseMode, PeerState};
 
@@ -13,7 +13,6 @@ pub enum LifecycleError {
     StaleRevision,
     StaleAcknowledgment,
     RevokedIsTerminal,
-    UnblockDoesNotRevive,
     RenewalDoesNotExtend,
 }
 
@@ -31,12 +30,39 @@ pub enum TaskBindError {
     NotSingleTaskMode,
 }
 
-/// Local pair policy. A block is not a revoke, and clearing it does not
-/// restore a relationship that was already revoked.
+/// One pair block (D7). The destination platform keys it by (source
+/// platform, requester reference, destination address); the source platform
+/// keeps the same record keyed by (its own account, destination address) to
+/// enforce the block for the whole account. Platforms own the records; this
+/// type and `apply_pair_block` are the shared rules.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
-pub enum PairBlock {
-    Open,
-    Blocked,
+pub struct PairBlockRecord {
+    pub state: PairBlockState,
+    pub block_revision: u64,
+}
+
+/// Apply a block or unblock at `revision`. Revisions only move forward; the
+/// same revision with the same state is an idempotent replay. An unblock
+/// changes only this record: it never creates consent and never revives a
+/// relationship (new consent requires a new request).
+pub fn apply_pair_block(
+    current: Option<PairBlockRecord>,
+    state: PairBlockState,
+    revision: u64,
+) -> Result<PairBlockRecord, LifecycleError> {
+    let next = PairBlockRecord { state, block_revision: revision };
+    match current {
+        Some(existing) if existing == next => Ok(existing),
+        Some(existing) if revision <= existing.block_revision => Err(LifecycleError::StaleRevision),
+        _ if revision == 0 => Err(LifecycleError::StaleRevision),
+        _ => Ok(next),
+    }
+}
+
+/// A block makes every affected relationship permanently unusable. The
+/// relationship is also revoked through the normal revoke event.
+pub fn block_relationship(record: &mut LifecycleRecord) {
+    record.grant_usable = false;
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -61,7 +87,6 @@ pub struct LifecycleRecord {
     pub key_purpose_revision: u64,
     pub acknowledged_key_purpose_revision: Option<u64>,
     pub revoked: bool,
-    pub block: PairBlock,
     pub prior_revisions: Vec<AuditedRevision>,
     pub bound_task_id: Option<String>,
 }
@@ -77,6 +102,8 @@ pub enum AffirmativeTraffic {
 pub struct ReadinessInput<'a> {
     pub peer: PeerState,
     pub record: &'a LifecycleRecord,
+    /// The platform's pair-block record for this relationship's pair.
+    pub pair_block: PairBlockState,
     /// The source host's own current authorization. A durable `AUTHORIZED`
     /// event must not be passed here as if it were this fact.
     pub host_source_authorization_current: bool,
@@ -198,19 +225,6 @@ pub fn apply_config_ack(
     Ok(())
 }
 
-pub fn apply_block(record: &mut LifecycleRecord) {
-    record.block = PairBlock::Blocked;
-    record.grant_usable = false;
-}
-
-pub fn apply_unblock(record: &mut LifecycleRecord) -> Result<(), LifecycleError> {
-    if record.revoked {
-        return Err(LifecycleError::UnblockDoesNotRevive);
-    }
-    record.block = PairBlock::Open;
-    Ok(())
-}
-
 /// A pending renewal is a new request. It does not extend the current lease.
 pub fn pending_renewal_extends_current_lease() -> bool {
     false
@@ -284,7 +298,7 @@ pub fn derive_ready(input: ReadinessInput<'_>) -> bool {
     finite_lease_still_effective(input.lease_expires_at, input.now)
         && input.peer == PeerState::Active
         && !record.revoked
-        && record.block == PairBlock::Open
+        && input.pair_block == PairBlockState::Open
         && record.remote_terms_digest == Some(record.local_terms_digest)
         && input.host_source_authorization_current
         && !matches!(
@@ -329,7 +343,6 @@ mod tests {
             key_purpose_revision: 5,
             acknowledged_key_purpose_revision: None,
             revoked: false,
-            block: PairBlock::Open,
             prior_revisions: Vec::new(),
             bound_task_id: None,
         }
@@ -349,6 +362,7 @@ mod tests {
         ReadinessInput {
             peer: PeerState::Active,
             record,
+            pair_block: PairBlockState::Open,
             host_source_authorization_current: true,
             now: 1,
             lease_expires_at: None,
@@ -473,17 +487,39 @@ mod tests {
     }
 
     #[test]
-    fn unblock_does_not_resurrect_a_revoked_relationship() {
+    fn unblock_does_not_resurrect_a_blocked_relationship() {
         let mut record = record();
-        apply_block(&mut record);
+        record.acknowledged_configuration_revision = Some(3);
+        record.acknowledged_key_purpose_revision = Some(5);
+        assert!(derive_ready(ready_input(&record)));
+        let blocked = apply_pair_block(None, PairBlockState::Blocked, 1).unwrap();
+        block_relationship(&mut record);
         apply_revoke(&mut record, &revoke(2)).unwrap();
+        let mut input = ready_input(&record);
+        input.pair_block = blocked.state;
+        assert!(!derive_ready(input));
+        let open = apply_pair_block(Some(blocked), PairBlockState::Open, 2).unwrap();
+        let mut input = ready_input(&record);
+        input.pair_block = open.state;
+        assert!(record.revoked && !record.grant_usable);
+        assert!(!derive_ready(input));
+    }
+
+    #[test]
+    fn pair_block_revisions_only_move_forward() {
+        let blocked = apply_pair_block(None, PairBlockState::Blocked, 3).unwrap();
+        assert_eq!(apply_pair_block(Some(blocked), PairBlockState::Blocked, 3), Ok(blocked));
         assert_eq!(
-            apply_unblock(&mut record),
-            Err(LifecycleError::UnblockDoesNotRevive)
+            apply_pair_block(Some(blocked), PairBlockState::Open, 3),
+            Err(LifecycleError::StaleRevision)
         );
-        assert!(record.revoked);
-        assert_eq!(record.block, PairBlock::Blocked);
-        assert!(!derive_ready(ready_input(&record)));
+        assert_eq!(
+            apply_pair_block(Some(blocked), PairBlockState::Open, 2),
+            Err(LifecycleError::StaleRevision)
+        );
+        assert_eq!(apply_pair_block(None, PairBlockState::Blocked, 0), Err(LifecycleError::StaleRevision));
+        let open = apply_pair_block(Some(blocked), PairBlockState::Open, 4).unwrap();
+        assert_eq!(open.state, PairBlockState::Open);
     }
 
     #[test]

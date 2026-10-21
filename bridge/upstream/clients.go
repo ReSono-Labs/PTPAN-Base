@@ -1,18 +1,16 @@
-// Package upstream calls the selected upstream Directory, OASF, and SPIFFE
-// modules. It does not make PTPAN Base peer or relationship decisions.
+// Package upstream holds the optional AGNTCY Directory and OASF clients for
+// the publication path and optional Directory evidence. bridge-runtime does
+// not open them: no PTPAN trust decision depends on Directory.
 package upstream
 
 import (
 	"context"
-	"crypto/tls"
 	"errors"
 	"fmt"
 	"os"
-	"time"
 
 	catalogv1 "github.com/agntcy/dir/api/catalog/v1"
 	corev1 "github.com/agntcy/dir/api/core/v1"
-	namingv1 "github.com/agntcy/dir/api/naming/v1"
 	routingv1 "github.com/agntcy/dir/api/routing/v1"
 	searchv1 "github.com/agntcy/dir/api/search/v1"
 	signv1 "github.com/agntcy/dir/api/sign/v1"
@@ -105,7 +103,6 @@ func Open(ctx context.Context, cfg Config) (*Clients, error) {
 		RoutingServiceClient: routingv1.NewRoutingServiceClient(catalogConn),
 		SearchServiceClient:  searchv1.NewSearchServiceClient(catalogConn),
 		SignServiceClient:    signv1.NewSignServiceClient(catalogConn),
-		NamingServiceClient:  namingv1.NewNamingServiceClient(catalogConn),
 	}
 	return &Clients{
 		Directory:      dir,
@@ -125,25 +122,6 @@ func (c *Clients) Close() error {
 
 func (c *Clients) ReadCatalog(ctx context.Context) (*catalogv1.GetWellKnownCatalogResponse, error) {
 	return c.Catalog.GetWellKnownCatalog(ctx, &catalogv1.GetWellKnownCatalogRequest{})
-}
-
-// PeerClientTLS and PeerServerTLS use the live SPIRE Workload API source for
-// SVIDs and federated bundles. Both authorize one exact peer service ID.
-// SPIRE, not this bridge, administers federation and bundle refresh.
-func (c *Clients) PeerClientTLS(expectedServerID string) (*tls.Config, error) {
-	id, err := spiffeid.FromString(expectedServerID)
-	if err != nil {
-		return nil, fmt.Errorf("peer server SPIFFE ID: %w", err)
-	}
-	return tlsconfig.MTLSClientConfig(c.Workload, c.Workload, tlsconfig.AuthorizeID(id)), nil
-}
-
-func (c *Clients) PeerServerTLS(expectedClientID string) (*tls.Config, error) {
-	id, err := spiffeid.FromString(expectedClientID)
-	if err != nil {
-		return nil, fmt.Errorf("peer client SPIFFE ID: %w", err)
-	}
-	return tlsconfig.MTLSServerConfig(c.Workload, c.Workload, tlsconfig.AuthorizeID(id)), nil
 }
 
 func (c *Clients) ValidateRecord(ctx context.Context, record *structpb.Struct) (bool, []string, []string, error) {
@@ -198,48 +176,4 @@ func (c *Clients) UnpublishRecord(ctx context.Context, ref *corev1.RecordRef) er
 
 func (c *Clients) VerifyRecord(ctx context.Context, ref *corev1.RecordRef) (*signv1.VerifyResponse, error) {
 	return c.Directory.Verify(ctx, &signv1.VerifyRequest{RecordRef: ref})
-}
-
-// ResolveProviderName returns every Directory candidate. Base must evaluate
-// each candidate's provenance and never assume the first one is trusted.
-func (c *Clients) ResolveProviderName(ctx context.Context, name, version string) (*namingv1.ResolveResponse, error) {
-	if name == "" {
-		return nil, errors.New("provider evidence name is required")
-	}
-	return c.Directory.Resolve(ctx, name, version)
-}
-
-func (c *Clients) VerificationInfoByCID(ctx context.Context, cid string) (*namingv1.GetVerificationInfoResponse, error) {
-	return c.Directory.GetVerificationInfo(ctx, cid)
-}
-
-// NameEvidenceByCID returns Directory's own verification result together with
-// the name in the selected record. Base still decides whether these values
-// match its independently provisioned provider bootstrap and current manifest.
-func (c *Clients) NameEvidenceByCID(ctx context.Context, cid, localDirectoryServiceID string) (map[string]any, error) {
-	if cid == "" || localDirectoryServiceID == "" {
-		return nil, errors.New("CID and local Directory service identity required")
-	}
-	info, err := c.VerificationInfoByCID(ctx, cid)
-	if err != nil { return nil, err }
-	if !info.GetVerified() { return nil, errors.New("Directory name is unverified") }
-	domain := info.GetVerification().GetDomain()
-	if domain == nil || domain.GetDomain() == "" || domain.GetMethod() == "" || domain.GetKeyId() == "" || domain.GetVerifiedAt() == nil {
-		return nil, errors.New("Directory name evidence incomplete")
-	}
-	record, err := c.Pull(ctx, &corev1.RecordRef{Cid:cid})
-	if err != nil { return nil, err }
-	if record.GetData() == nil || record.GetData().GetFields()["name"] == nil || record.GetData().GetFields()["name"].GetStringValue() == "" {
-		return nil, errors.New("Directory record name missing")
-	}
-	return map[string]any{
-		"record_cid":cid,
-		"record_name":record.GetData().GetFields()["name"].GetStringValue(),
-		"verified":true,
-		"domain":domain.GetDomain(),
-		"method":domain.GetMethod(),
-		"key_id":domain.GetKeyId(),
-		"verified_at":domain.GetVerifiedAt().AsTime().UTC().Format(time.RFC3339Nano),
-		"source_directory_service_id":localDirectoryServiceID,
-	},nil
 }

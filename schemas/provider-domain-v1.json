@@ -1,0 +1,51 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "ptpan-provider-domain/1",
+  "title": "PTPAN provider domain document",
+  "description": "Served at https://<provider domain>/.well-known/ptpan-provider.json with the platform's WebPKI certificate (D14). Publishes no peers and no accounts.",
+  "type": "object",
+  "additionalProperties": false,
+  "required": [
+    "schema",
+    "platform_id",
+    "control_service_identity",
+    "edge_service_identity",
+    "agent_ca_root"
+  ],
+  "properties": {
+    "schema": {
+      "const": "ptpan-provider-domain/1"
+    },
+    "platform_id": {
+      "$ref": "#/$defs/id"
+    },
+    "control_service_identity": {
+      "$ref": "#/$defs/spiffe_id"
+    },
+    "edge_service_identity": {
+      "$ref": "#/$defs/spiffe_id"
+    },
+    "agent_ca_root": {
+      "$ref": "#/$defs/ca_root"
+    }
+  },
+  "$defs": {
+    "id": {
+      "type": "string",
+      "minLength": 1,
+      "maxLength": 256
+    },
+    "spiffe_id": {
+      "type": "string",
+      "minLength": 1,
+      "maxLength": 256,
+      "pattern": "^spiffe://"
+    },
+    "ca_root": {
+      "type": "string",
+      "maxLength": 10924,
+      "pattern": "^[A-Za-z0-9+/]+={0,2}$",
+      "description": "Standard base64 DER of the platform's private agent CA root (D13)."
+    }
+  }
+}

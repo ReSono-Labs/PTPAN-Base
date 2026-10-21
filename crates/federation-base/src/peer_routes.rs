@@ -44,16 +44,6 @@ pub fn select_peer(
     Ok(platform.clone())
 }
 
-/// Failure of one recipient leaves every other recipient's queued delivery
-/// in place. The failed recipient is retried on its own queue.
-pub fn other_peers_remain_queued(queued: &[PlatformId], failed: &PlatformId) -> Vec<PlatformId> {
-    queued
-        .iter()
-        .filter(|peer| *peer != failed)
-        .cloned()
-        .collect()
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -96,7 +86,7 @@ mod tests {
             Err(RouteError::ClaimedIdentityMismatch)
         );
         assert_eq!(
-            select_peer("spiffe://link-d.test/federation/control", &platform("link-d"), &routes),
+            select_peer("spiffe://provider-d.test/federation/control", &platform("provider-d"), &routes),
             Err(RouteError::UnknownService)
         );
     }
@@ -118,16 +108,4 @@ mod tests {
         );
     }
 
-    #[test]
-    fn failure_of_one_peer_leaves_the_other_queued() {
-        let queued = [platform("provider-b"), platform("provider-c")];
-        assert_eq!(
-            other_peers_remain_queued(&queued, &platform("provider-b")),
-            vec![platform("provider-c")]
-        );
-        assert_eq!(
-            other_peers_remain_queued(&queued, &platform("provider-c")),
-            vec![platform("provider-b")]
-        );
-    }
 }

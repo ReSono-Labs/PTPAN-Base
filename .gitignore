@@ -1,2 +1,10 @@
+# Ladder ledgers and build output
+/artifacts/
 /target/
 /bridge/bin/
+/.env
+/.env.*
+!/.env.example
+**/*.key
+**/*.pem
+**/*.p12

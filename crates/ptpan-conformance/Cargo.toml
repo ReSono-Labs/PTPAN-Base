@@ -1,0 +1,16 @@
+[package]
+name = "ptpan-conformance"
+version = "0.1.0"
+edition = "2021"
+rust-version = "1.85"
+license = "Apache-2.0"
+description = "Black-box conformance checks for a PTPAN PlatformService implementation (review 11.8)"
+publish = false
+
+[dependencies]
+federation-base = { path = "../federation-base" }
+ptpan-platform-api = { path = "../ptpan-platform-api" }
+tokio = { version = "=1.54.0", features = ["rt-multi-thread", "time", "net"] }
+tonic = { version = "=0.13.1", default-features = false, features = ["transport", "router", "codegen", "prost"] }
+ed25519-dalek = "=2.2.0"
+serde_json = "1"
